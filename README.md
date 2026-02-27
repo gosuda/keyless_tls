@@ -118,22 +118,61 @@ APIs to inspect ClientHello and route by SNI/ALPN while keeping all policy in ca
 - `l4.InspectClientHello(conn, timeout)`: parse `ServerName`/`ALPNProtocols` and return a wrapped `net.Conn`
 - `l4.Proxy.DialByClientHello(ctx, info, parseErr)`: caller decides route/fallback/reject policy
 
+How this works in practice:
+
+1) incoming TCP connection arrives
+2) library reads only ClientHello metadata (no TLS termination)
+3) your callback receives `info.ServerName`, `info.ALPNProtocols`, and `parseErr`
+4) your code selects upstream target (or rejects)
+5) relay continues raw TCP forwarding with no payload loss
+
+Typical SDK routing policies:
+
+- Multi-tenant host routing: `app1.example.com -> tenant A`, `app2.example.com -> tenant B`
+- Protocol-aware routing: `h2` preferred upstream vs `http/1.1` upstream
+- Strict security mode: reject when ClientHello parse fails
+- Compatibility mode: fallback to default upstream when parse fails
+
+Concrete policy example (easy to adapt):
+
 ```go
+routes := map[string]string{
+    "app1.demo.local": "127.0.0.1:9001",
+    "app2.demo.local": "127.0.0.1:9002",
+}
+
 proxy := &l4.Proxy{
     ListenAddr:         ":443",
     ClientHelloTimeout: 2 * time.Second,
     DialByClientHello: func(ctx context.Context, info l4.ClientHelloInfo, parseErr error) (net.Conn, error) {
-        // Caller owns all policy decisions.
+        d := net.Dialer{Timeout: 3 * time.Second}
+
+        // 1) Decide what to do with non-TLS / invalid ClientHello
         if parseErr != nil {
-            return dial(ctx, "127.0.0.1:9000") // or reject
+            // strict mode: return nil, parseErr
+            // compatibility mode: send to default route
+            return d.DialContext(ctx, "tcp", "127.0.0.1:9011")
         }
-        if info.ServerName == "app1.demo.local" {
-            return dial(ctx, "127.0.0.1:9001")
+
+        // 2) SNI host-based route
+        if target, ok := routes[strings.ToLower(strings.TrimSuffix(info.ServerName, "."))]; ok {
+            return d.DialContext(ctx, "tcp", target)
         }
-        return dial(ctx, "127.0.0.1:9011") // default route
+
+        // 3) Optional ALPN-aware split
+        for _, proto := range info.ALPNProtocols {
+            if proto == "h2" {
+                return d.DialContext(ctx, "tcp", "127.0.0.1:9443")
+            }
+        }
+
+        // 4) Default route
+        return d.DialContext(ctx, "tcp", "127.0.0.1:9011")
     },
 }
 ```
+
+For a complete runnable SDK-style routing sample with 10 hosts, see `examples/relay-10-targets`.
 
 ### SDK integration checklist
 

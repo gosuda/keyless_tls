@@ -127,8 +127,21 @@ Example applications are separated under `examples/`.
 ### Command layout
 
 - `cmd/relay-signer`: remote signer HTTPS server
-- `cmd/relay-l4`: L4 TCP relay forwarding external port to the internal tunnel app
+- `cmd/relay-l4`: L4 TCP relay with optional SNI-based route mapping
 - `examples/tunnel-http`: example tunnel HTTP server integrated with the SDK
+- `examples/relay-10-targets`: one relay server routing to 10 target hosts via SNI
+
+### SNI/ALPN routing hook for custom relays
+
+If you are building your own relay/proxy, use `relay/l4.InspectClientHello` to read
+ClientHello metadata (`ServerName`, `ALPNProtocols`) without terminating TLS.
+
+The helper returns a wrapped `net.Conn` that replays already-read bytes, so your
+relay can continue normal TCP forwarding after routing decisions.
+
+`relay/l4.Proxy` also supports callback-based dialing through
+`DialByClientHello(ctx, info, parseErr)`, so all policy decisions (fallback, reject,
+default route) remain in caller code.
 
 ### Quick start with three processes
 
@@ -162,6 +175,74 @@ go run ./cmd/relay-l4 \
   -listen :443 \
   -upstream 127.0.0.1:8443
 ```
+
+SNI route mode (`-route` can be repeated):
+
+```bash
+go run ./cmd/relay-l4 \
+  -listen :443 \
+  -route app1.example.com=127.0.0.1:8441 \
+  -route app2.example.com=127.0.0.1:8442 \
+  -default-upstream 127.0.0.1:8440
+```
+
+`cmd/relay-l4` does not enforce routing policy. Caller-side policy is controlled by flags,
+including whether ClientHello parse failures may use the default upstream.
+
+Useful `cmd/relay-l4` route-mode flags:
+
+- `-route host=upstream` (repeatable): explicit SNI mapping
+- `-default-upstream`: fallback target for unknown SNI
+- `-allow-parse-error`: allow non-TLS/invalid ClientHello to use fallback
+- `-clienthello-timeout`: maximum ClientHello inspection time
+
+### Example app: one relay routing 10 target hosts
+
+`examples/relay-10-targets` demonstrates a practical ingress layout:
+
+- one public relay listener
+- ten target tunnel apps
+- SNI-based target selection implemented by caller code
+
+Run the example relay:
+
+```bash
+go run ./examples/relay-10-targets \
+  -listen :443 \
+  -upstream-host 127.0.0.1 \
+  -base-port 9001 \
+  -domain demo.local \
+  -default-upstream 127.0.0.1:9011
+```
+
+Generated static routes:
+
+- `app1.demo.local -> 127.0.0.1:9001`
+- `app2.demo.local -> 127.0.0.1:9002`
+- `app3.demo.local -> 127.0.0.1:9003`
+- `app4.demo.local -> 127.0.0.1:9004`
+- `app5.demo.local -> 127.0.0.1:9005`
+- `app6.demo.local -> 127.0.0.1:9006`
+- `app7.demo.local -> 127.0.0.1:9007`
+- `app8.demo.local -> 127.0.0.1:9008`
+- `app9.demo.local -> 127.0.0.1:9009`
+- `app10.demo.local -> 127.0.0.1:9010`
+
+Policy remains caller-owned:
+
+- known SNI: route to mapped upstream
+- unknown SNI: route to `-default-upstream` when configured
+- non-TLS or invalid ClientHello: route to `-default-upstream` when configured, otherwise reject
+
+Important flags for `examples/relay-10-targets`:
+
+- `-listen`: public relay address
+- `-upstream-host`: host used for generated targets
+- `-base-port`: first target port (`app1`)
+- `-domain`: host suffix used for SNI matching
+- `-default-upstream`: optional fallback upstream
+- `-dial-timeout`: upstream dial timeout
+- `-clienthello-timeout`: ClientHello inspection timeout
 
 ### Protect signer with mTLS
 
@@ -205,7 +286,7 @@ go run ./examples/tunnel-http \
 - `relay/signrpc`: signer JSON request/response types
 - `relay/signer`: signing service/key store
 - `relay/server`: signer HTTPS (TLS/mTLS) server launcher
-- `relay/l4`: TCP passthrough relay
+- `relay/l4`: TCP passthrough relay + optional ClientHello (SNI/ALPN) inspection hook
 
 ## Current status
 

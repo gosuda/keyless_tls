@@ -6,18 +6,21 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 type Proxy struct {
-	ListenAddr  string
-	DialTimeout func(context.Context) (net.Conn, error)
+	ListenAddr         string
+	DialTimeout        func(context.Context) (net.Conn, error)
+	DialByClientHello  func(context.Context, ClientHelloInfo, error) (net.Conn, error)
+	ClientHelloTimeout time.Duration
 }
 
 func (p *Proxy) Serve(ctx context.Context) error {
 	if p.ListenAddr == "" {
 		return fmt.Errorf("listen addr is required")
 	}
-	if p.DialTimeout == nil {
+	if p.DialTimeout == nil && p.DialByClientHello == nil {
 		return fmt.Errorf("dial function is required")
 	}
 
@@ -48,11 +51,29 @@ func (p *Proxy) Serve(ctx context.Context) error {
 func (p *Proxy) handleConn(ctx context.Context, clientConn net.Conn) {
 	defer clientConn.Close()
 
+	if p.DialByClientHello != nil {
+		helloInfo, wrappedConn, helloErr := InspectClientHello(clientConn, p.ClientHelloTimeout)
+		clientConn = wrappedConn
+		upstream, err := p.DialByClientHello(ctx, helloInfo, helloErr)
+		if err != nil {
+			return
+		}
+		defer upstream.Close()
+
+		pipe(clientConn, upstream)
+		return
+	}
+
 	upstream, err := p.DialTimeout(ctx)
 	if err != nil {
 		return
 	}
 	defer upstream.Close()
+
+	pipe(clientConn, upstream)
+}
+
+func pipe(clientConn, upstream net.Conn) {
 
 	var wg sync.WaitGroup
 	wg.Add(2)

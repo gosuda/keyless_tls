@@ -8,8 +8,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"keyless_tls/relay/server"
-	"keyless_tls/relay/signer"
+	"github.com/gosuda/keyless_tls/relay/server"
+	"github.com/gosuda/keyless_tls/relay/signer"
 )
 
 func main() {

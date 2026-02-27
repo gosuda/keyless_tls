@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"keyless_tls/relay/signrpc"
+	"github.com/gosuda/keyless_tls/relay/signrpc"
 )
 
 func TestSignerTLSConfig_ServerAuthOnlyByDefault(t *testing.T) {

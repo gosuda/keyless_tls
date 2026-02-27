@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"keyless_tls/relay/signer"
-	"keyless_tls/relay/signrpc"
+	"github.com/gosuda/keyless_tls/relay/signer"
+	"github.com/gosuda/keyless_tls/relay/signrpc"
 )
 
 type Config struct {

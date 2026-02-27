@@ -43,7 +43,7 @@ import (
     "net/http"
     "os"
 
-    "keyless_tls/keyless"
+    "github.com/gosuda/keyless_tls/keyless"
 )
 
 func main() {

@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"time"
 
-	"keyless_tls/relay/signrpc"
+	"github.com/gosuda/keyless_tls/relay/signrpc"
 )
 
 var (

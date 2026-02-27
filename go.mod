@@ -1,3 +1,3 @@
-module keyless_tls
+module github.com/gosuda/keyless_tls
 
-go 1.26.0
+go 1.25.0

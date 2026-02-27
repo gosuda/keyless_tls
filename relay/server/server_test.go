@@ -22,8 +22,8 @@ import (
 	"testing"
 	"time"
 
-	"keyless_tls/relay/signer"
-	"keyless_tls/relay/signrpc"
+	"github.com/gosuda/keyless_tls/relay/signer"
+	"github.com/gosuda/keyless_tls/relay/signrpc"
 )
 
 func TestServerTLSConfig_NoMTLS(t *testing.T) {

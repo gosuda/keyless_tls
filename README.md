@@ -110,6 +110,31 @@ if err != nil {
 }
 ```
 
+### SDK: SNI metadata for relay routing (caller-controlled)
+
+If you are implementing your own relay/proxy with this library, use the `relay/l4`
+APIs to inspect ClientHello and route by SNI/ALPN while keeping all policy in caller code.
+
+- `l4.InspectClientHello(conn, timeout)`: parse `ServerName`/`ALPNProtocols` and return a wrapped `net.Conn`
+- `l4.Proxy.DialByClientHello(ctx, info, parseErr)`: caller decides route/fallback/reject policy
+
+```go
+proxy := &l4.Proxy{
+    ListenAddr:         ":443",
+    ClientHelloTimeout: 2 * time.Second,
+    DialByClientHello: func(ctx context.Context, info l4.ClientHelloInfo, parseErr error) (net.Conn, error) {
+        // Caller owns all policy decisions.
+        if parseErr != nil {
+            return dial(ctx, "127.0.0.1:9000") // or reject
+        }
+        if info.ServerName == "app1.demo.local" {
+            return dial(ctx, "127.0.0.1:9001")
+        }
+        return dial(ctx, "127.0.0.1:9011") // default route
+    },
+}
+```
+
 ### SDK integration checklist
 
 - Deploy only the public certificate chain (`cert PEM`) in the tunnel app

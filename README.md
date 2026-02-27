@@ -6,7 +6,7 @@
 
 - TLS engine, session keys, traffic crypto: `tunneling app`
 - TLS signing (`CertificateVerify`): remote `relay signer`
-- Signer transport: `gRPC over TLS` by default, optional `mTLS`
+- Signer transport: `HTTPS + JSON` by default, optional `mTLS`
 
 This repository supports two usage modes:
 
@@ -126,7 +126,7 @@ Example applications are separated under `examples/`.
 
 ### Command layout
 
-- `cmd/relay-signer`: remote signer gRPC server
+- `cmd/relay-signer`: remote signer HTTPS server
 - `cmd/relay-l4`: L4 TCP relay forwarding external port to the internal tunnel app
 - `examples/tunnel-http`: example tunnel HTTP server integrated with the SDK
 
@@ -202,9 +202,9 @@ go run ./examples/tunnel-http \
 
 - `keyless`: SDK for application developers (tunnel app integration point)
 - `keyless/signerclient`: remote signer client implementation
-- `relay/signrpc`: signer RPC types/services
+- `relay/signrpc`: signer JSON request/response types
 - `relay/signer`: signing service/key store
-- `relay/server`: signer gRPC (TLS/mTLS) server launcher
+- `relay/server`: signer HTTPS (TLS/mTLS) server launcher
 - `relay/l4`: TCP passthrough relay
 
 ## Current status

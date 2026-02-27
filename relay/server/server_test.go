@@ -1,17 +1,29 @@
 package server
 
 import (
+	"bytes"
+	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
+	"io"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"keyless_tls/relay/signer"
+	"keyless_tls/relay/signrpc"
 )
 
 func TestServerTLSConfig_NoMTLS(t *testing.T) {
@@ -67,6 +79,112 @@ func TestServerTLSConfig_WithMTLSRequiresClientCA(t *testing.T) {
 	if !strings.Contains(err.Error(), "failed to parse client CA PEM") {
 		t.Fatalf("unexpected error: %v", err)
 	}
+}
+
+func TestSignHandler_Success(t *testing.T) {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
+	service := &signer.Service{
+		Store:       staticStore{signer: priv},
+		AllowedSkew: 30 * time.Second,
+	}
+	h := signHandler(service)
+
+	digest := sha256.Sum256([]byte("hello"))
+	body, err := json.Marshal(signrpc.SignRequest{
+		KeyID:         "relay-cert",
+		Algorithm:     signrpc.AlgorithmRSAPKCS1v15SHA256,
+		Digest:        digest[:],
+		TimestampUnix: time.Now().Unix(),
+		Nonce:         "abc",
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, signrpc.SignPath, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp signrpc.SignResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.KeyID != "relay-cert" {
+		t.Fatalf("unexpected key id: %s", resp.KeyID)
+	}
+	if len(resp.Signature) == 0 {
+		t.Fatal("expected signature in response")
+	}
+}
+
+func TestSignHandler_MethodNotAllowed(t *testing.T) {
+	h := signHandler(&signer.Service{Store: staticStore{signer: mustRSAKey(t)}})
+	req := httptest.NewRequest(http.MethodGet, signrpc.SignPath, nil)
+	rr := httptest.NewRecorder()
+
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	if rr.Header().Get("Allow") != http.MethodPost {
+		t.Fatalf("allow header = %q", rr.Header().Get("Allow"))
+	}
+}
+
+func TestSignHandler_MapsServiceError(t *testing.T) {
+	h := signHandler(&signer.Service{Store: staticStore{err: io.EOF}})
+	body, err := json.Marshal(signrpc.SignRequest{
+		KeyID:         "relay-cert",
+		Algorithm:     signrpc.AlgorithmRSAPKCS1v15SHA256,
+		Digest:        []byte{1},
+		TimestampUnix: time.Now().Unix(),
+		Nonce:         "abc",
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, signrpc.SignPath, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+type staticStore struct {
+	signer crypto.Signer
+	err    error
+}
+
+func (s staticStore) Signer(context.Context, string) (crypto.Signer, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.signer, nil
+}
+
+func mustRSAKey(t *testing.T) *rsa.PrivateKey {
+	t.Helper()
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	return priv
 }
 
 func testCertAndKeyPEM(isCA bool) ([]byte, []byte, error) {

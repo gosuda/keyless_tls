@@ -9,28 +9,29 @@ import (
 	"fmt"
 	"time"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
 	"keyless_tls/relay/signrpc"
 )
 
-type Service struct {
-	signrpc.UnimplementedSignerServiceServer
+var (
+	ErrInvalidArgument  = errors.New("invalid argument")
+	ErrPermissionDenied = errors.New("permission denied")
+	ErrInternal         = errors.New("internal")
+)
 
+type Service struct {
 	Store       KeyStore
 	AllowedSkew time.Duration
 }
 
 func (s *Service) Sign(ctx context.Context, req *signrpc.SignRequest) (*signrpc.SignResponse, error) {
 	if req == nil {
-		return nil, status.Error(codes.InvalidArgument, "request is nil")
+		return nil, fmt.Errorf("%w: request is nil", ErrInvalidArgument)
 	}
 	if req.KeyID == "" || len(req.Digest) == 0 || req.Algorithm == "" || req.Nonce == "" {
-		return nil, status.Error(codes.InvalidArgument, "missing required field")
+		return nil, fmt.Errorf("%w: missing required field", ErrInvalidArgument)
 	}
 	if s.Store == nil {
-		return nil, status.Error(codes.Internal, "signer store is not configured")
+		return nil, fmt.Errorf("%w: signer store is not configured", ErrInternal)
 	}
 
 	skew := s.AllowedSkew
@@ -39,17 +40,17 @@ func (s *Service) Sign(ctx context.Context, req *signrpc.SignRequest) (*signrpc.
 	}
 	now := time.Now().Unix()
 	if req.TimestampUnix < now-int64(skew.Seconds()) || req.TimestampUnix > now+int64(skew.Seconds()) {
-		return nil, status.Error(codes.InvalidArgument, "request timestamp outside allowed skew")
+		return nil, fmt.Errorf("%w: request timestamp outside allowed skew", ErrInvalidArgument)
 	}
 
 	signer, err := s.Store.Signer(ctx, req.KeyID)
 	if err != nil {
-		return nil, status.Error(codes.PermissionDenied, err.Error())
+		return nil, fmt.Errorf("%w: %s", ErrPermissionDenied, err.Error())
 	}
 
 	sig, err := signByAlgorithm(signer, req.Digest, req.Algorithm)
 	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+		return nil, fmt.Errorf("%w: %s", ErrInvalidArgument, err.Error())
 	}
 
 	return &signrpc.SignResponse{KeyID: req.KeyID, Algorithm: req.Algorithm, Signature: sig}, nil

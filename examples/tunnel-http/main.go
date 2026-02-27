@@ -13,7 +13,7 @@ func main() {
 	var (
 		listenAddr     = flag.String("listen", ":8443", "HTTPS listen address")
 		certPath       = flag.String("cert", "", "public certificate PEM path")
-		signerAddr     = flag.String("signer-addr", "", "gRPC signer address (host:port)")
+		signerAddr     = flag.String("signer-addr", "", "HTTPS signer address (host:port or https://host:port)")
 		signerName     = flag.String("signer-name", "", "TLS server name for signer")
 		keyID          = flag.String("key-id", "default", "remote key identifier")
 		enableMTLS     = flag.Bool("enable-mtls", false, "enable client certificate for signer mTLS")

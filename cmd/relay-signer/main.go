@@ -14,11 +14,11 @@ import (
 
 func main() {
 	var (
-		listenAddr = flag.String("listen", ":9443", "gRPC signer listen address")
+		listenAddr = flag.String("listen", ":9443", "HTTPS signer listen address")
 		keyID      = flag.String("key-id", "default", "key identifier exposed to clients")
 		certPath   = flag.String("tls-cert", "", "server TLS certificate PEM path")
 		keyPath    = flag.String("tls-key", "", "server TLS private key PEM path")
-		enableMTLS = flag.Bool("enable-mtls", false, "require and verify client certificate for signer gRPC")
+		enableMTLS = flag.Bool("enable-mtls", false, "require and verify client certificate for signer HTTPS")
 		clientCA   = flag.String("client-ca", "", "client CA PEM path")
 		signKey    = flag.String("sign-key", "", "keyless signing private key PEM path")
 	)

@@ -1,6 +1,7 @@
 package signerclient
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdsa"
@@ -9,15 +10,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"strings"
 	"time"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/keepalive"
 
 	"keyless_tls/relay/signrpc"
 )
@@ -25,8 +25,8 @@ import (
 type RemoteSigner struct {
 	keyID     string
 	publicKey crypto.PublicKey
-	client    signrpc.SignerServiceClient
-	conn      *grpc.ClientConn
+	endpoint  string
+	client    *http.Client
 	timeout   time.Duration
 }
 
@@ -52,21 +52,20 @@ func NewRemoteSigner(cfg RemoteSignerConfig, certPEM []byte) (*RemoteSigner, err
 		return nil, err
 	}
 
-	conn, err := grpc.Dial(
-		cfg.Endpoint,
-		grpc.WithTransportCredentials(credentials.NewTLS(tlsConf)),
-		grpc.WithDefaultCallOptions(grpc.ForceCodec(signrpc.JSONCodec{})),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: 30 * time.Second, Timeout: 5 * time.Second}),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("dial signer service: %w", err)
+	endpoint := signEndpoint(cfg.Endpoint)
+	transport := &http.Transport{
+		TLSClientConfig:     tlsConf,
+		MaxIdleConns:        100,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 5 * time.Second,
 	}
+	client := &http.Client{Transport: transport}
 
 	return &RemoteSigner{
 		keyID:     cfg.KeyID,
 		publicKey: pub,
-		client:    signrpc.NewSignerServiceClient(conn),
-		conn:      conn,
+		endpoint:  endpoint,
+		client:    client,
 		timeout:   cfg.Timeout,
 	}, nil
 }
@@ -121,7 +120,7 @@ func (s *RemoteSigner) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) 
 	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
 	defer cancel()
 
-	resp, err := s.client.Sign(ctx, &signrpc.SignRequest{
+	reqBody, err := json.Marshal(&signrpc.SignRequest{
 		KeyID:         s.keyID,
 		Algorithm:     alg,
 		Digest:        digest,
@@ -129,17 +128,51 @@ func (s *RemoteSigner) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) 
 		Nonce:         nonce,
 	})
 	if err != nil {
+		return nil, fmt.Errorf("encode sign request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.endpoint, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("build sign request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	httpResp, err := s.client.Do(req)
+	if err != nil {
 		return nil, fmt.Errorf("remote sign request failed: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode != http.StatusOK {
+		var errResp signrpc.ErrorResponse
+		if decodeErr := json.NewDecoder(httpResp.Body).Decode(&errResp); decodeErr == nil && errResp.Error != "" {
+			return nil, fmt.Errorf("remote sign request failed: %s", errResp.Error)
+		}
+		return nil, fmt.Errorf("remote sign request failed: http %d", httpResp.StatusCode)
+	}
+
+	var resp signrpc.SignResponse
+	if err := json.NewDecoder(httpResp.Body).Decode(&resp); err != nil {
+		return nil, fmt.Errorf("decode sign response: %w", err)
 	}
 
 	return resp.Signature, nil
 }
 
 func (s *RemoteSigner) Close() error {
-	if s.conn == nil {
+	if s.client == nil {
 		return nil
 	}
-	return s.conn.Close()
+	s.client.CloseIdleConnections()
+	return nil
+}
+
+func signEndpoint(endpoint string) string {
+	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
+		return strings.TrimRight(endpoint, "/") + signrpc.SignPath
+	}
+	return "https://" + strings.TrimRight(endpoint, "/") + signrpc.SignPath
 }
 
 func parsePublicKeyFromCert(certPEM []byte) (crypto.PublicKey, error) {

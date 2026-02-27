@@ -4,12 +4,13 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
+	"net/http"
+	"strings"
+	"time"
 
 	"keyless_tls/relay/signer"
 	"keyless_tls/relay/signrpc"
@@ -41,16 +42,68 @@ func ListenAndServe(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("listen signer server: %w", err)
 	}
+	tlsLis := tls.NewListener(lis, tlsConf)
 
-	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(tlsConf)))
-	signrpc.RegisterSignerServiceServer(grpcServer, cfg.SignerService)
+	httpServer := &http.Server{Handler: signHandler(cfg.SignerService)}
 
 	go func() {
 		<-ctx.Done()
-		grpcServer.GracefulStop()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(shutdownCtx)
 	}()
 
-	return grpcServer.Serve(lis)
+	return httpServer.Serve(tlsLis)
+}
+
+func signHandler(service *signer.Service) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc(signrpc.SignPath, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+
+		if ct := r.Header.Get("Content-Type"); ct != "" && !strings.HasPrefix(ct, "application/json") {
+			writeJSONError(w, http.StatusUnsupportedMediaType, "content type must be application/json")
+			return
+		}
+
+		defer r.Body.Close()
+		var req signrpc.SignRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid json body")
+			return
+		}
+
+		resp, err := service.Sign(r.Context(), &req)
+		if err != nil {
+			status := http.StatusInternalServerError
+			switch {
+			case errors.Is(err, signer.ErrInvalidArgument):
+				status = http.StatusBadRequest
+			case errors.Is(err, signer.ErrPermissionDenied):
+				status = http.StatusForbidden
+			}
+			writeJSONError(w, status, err.Error())
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "failed to encode response")
+			return
+		}
+	})
+
+	return mux
+}
+
+func writeJSONError(w http.ResponseWriter, code int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(signrpc.ErrorResponse{Error: message})
 }
 
 func serverTLSConfig(certPEM, keyPEM, clientCAPEM []byte, enableMTLS bool) (*tls.Config, error) {

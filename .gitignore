@@ -1,0 +1,33 @@
+.DS_Store
+Thumbs.db
+
+# IDE/editor
+.idea/
+.vscode/
+
+# Environment
+.env
+.env.*
+
+# Go build artifacts
+bin/
+build/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go coverage/profiling
+coverage.out
+*.coverprofile
+
+# Local certificates and private keys
+certs/
+*.key
+*.pem
+*.p12
+*.pfx

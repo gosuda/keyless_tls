@@ -1,0 +1,31 @@
+<svg width="960" height="320" viewBox="0 0 960 320" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">keyless_tls logo</title>
+  <desc id="desc">Shield and keyhole logo for keyless TLS remote signing.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0E2A47"/>
+      <stop offset="100%" stop-color="#134E5E"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#5EEAD4"/>
+      <stop offset="100%" stop-color="#22C55E"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="960" height="320" rx="28" fill="url(#bg)"/>
+
+  <g transform="translate(52 44)">
+    <path d="M108 0L216 44V126C216 194 170 254 108 276C46 254 0 194 0 126V44L108 0Z" fill="url(#shield)"/>
+    <path d="M108 32L186 64V125C186 177 154 223 108 243C62 223 30 177 30 125V64L108 32Z" fill="#0D2B3F"/>
+    <circle cx="108" cy="118" r="24" fill="#E6FFFB"/>
+    <rect x="98" y="138" width="20" height="56" rx="10" fill="#E6FFFB"/>
+    <path d="M146 204H182" stroke="#E6FFFB" stroke-width="12" stroke-linecap="round"/>
+    <path d="M164 188V220" stroke="#E6FFFB" stroke-width="12" stroke-linecap="round"/>
+  </g>
+
+  <g fill="#EAF7FF" font-family="Segoe UI, Arial, sans-serif">
+    <text x="320" y="140" font-size="70" font-weight="700">keyless_tls</text>
+    <text x="322" y="192" font-size="26" font-weight="500" fill="#BEE8FF">Remote CertificateVerify Signing for TLS</text>
+    <text x="322" y="236" font-size="20" font-weight="400" fill="#A4D4E9">Handshake and traffic crypto stay in your tunnel app</text>
+  </g>
+</svg>

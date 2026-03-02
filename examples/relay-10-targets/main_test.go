@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"keyless_tls/relay/l4"
+	"github.com/gosuda/keyless_tls/relay/l4"
 )
 
 func TestBuildTenRoutes(t *testing.T) {

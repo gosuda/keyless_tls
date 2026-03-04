@@ -18,7 +18,6 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -26,21 +25,15 @@ import (
 	"github.com/gosuda/keyless_tls/relay/signrpc"
 )
 
-func TestServerTLSConfig_NoMTLS(t *testing.T) {
+func TestServerTLSConfig_RequiresClientCA(t *testing.T) {
 	serverCertPEM, serverKeyPEM, err := testCertAndKeyPEM(false)
 	if err != nil {
 		t.Fatalf("create server cert: %v", err)
 	}
 
-	tlsConf, err := serverTLSConfig(serverCertPEM, serverKeyPEM, nil, false)
-	if err != nil {
-		t.Fatalf("serverTLSConfig() error = %v", err)
-	}
-	if tlsConf.ClientAuth != tls.NoClientCert {
-		t.Fatalf("expected ClientAuth=%v, got %v", tls.NoClientCert, tlsConf.ClientAuth)
-	}
-	if tlsConf.ClientCAs != nil {
-		t.Fatal("expected ClientCAs to be nil when mTLS disabled")
+	_, err = serverTLSConfig(serverCertPEM, serverKeyPEM, nil)
+	if err == nil {
+		t.Fatal("expected error for missing client CA")
 	}
 }
 
@@ -54,7 +47,7 @@ func TestServerTLSConfig_WithMTLS(t *testing.T) {
 		t.Fatalf("create client CA cert: %v", err)
 	}
 
-	tlsConf, err := serverTLSConfig(serverCertPEM, serverKeyPEM, clientCAPEM, true)
+	tlsConf, err := serverTLSConfig(serverCertPEM, serverKeyPEM, clientCAPEM)
 	if err != nil {
 		t.Fatalf("serverTLSConfig() error = %v", err)
 	}
@@ -63,21 +56,6 @@ func TestServerTLSConfig_WithMTLS(t *testing.T) {
 	}
 	if tlsConf.ClientCAs == nil {
 		t.Fatal("expected ClientCAs to be set when mTLS is enabled")
-	}
-}
-
-func TestServerTLSConfig_WithMTLSRequiresClientCA(t *testing.T) {
-	serverCertPEM, serverKeyPEM, err := testCertAndKeyPEM(false)
-	if err != nil {
-		t.Fatalf("create server cert: %v", err)
-	}
-
-	_, err = serverTLSConfig(serverCertPEM, serverKeyPEM, nil, true)
-	if err == nil {
-		t.Fatal("expected error for missing client CA")
-	}
-	if !strings.Contains(err.Error(), "failed to parse client CA PEM") {
-		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

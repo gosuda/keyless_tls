@@ -21,21 +21,34 @@ import (
 	"github.com/gosuda/keyless_tls/relay/signrpc"
 )
 
-func TestSignerTLSConfig_ServerAuthOnlyByDefault(t *testing.T) {
+func TestSignerTLSConfig_RequiresClientCertificate(t *testing.T) {
 	rootCAPEM, _, err := testCertAndKeyPEM(true)
 	if err != nil {
 		t.Fatalf("create root CA cert: %v", err)
 	}
 
-	tlsConf, err := signerTLSConfig(RemoteSignerConfig{
+	_, err = signerTLSConfig(RemoteSignerConfig{
 		ServerName: "relay.internal",
 		RootCAPEM:  rootCAPEM,
 	})
-	if err != nil {
-		t.Fatalf("signerTLSConfig() error = %v", err)
+	if err == nil {
+		t.Fatal("expected signerTLSConfig to require client certificate")
 	}
-	if len(tlsConf.Certificates) != 0 {
-		t.Fatalf("expected no client certificate, got %d", len(tlsConf.Certificates))
+}
+
+func TestSignerTLSConfig_RequiresRootCA(t *testing.T) {
+	clientCertPEM, clientKeyPEM, err := testCertAndKeyPEM(false)
+	if err != nil {
+		t.Fatalf("create client cert: %v", err)
+	}
+
+	_, err = signerTLSConfig(RemoteSignerConfig{
+		ServerName:    "relay.internal",
+		ClientCertPEM: clientCertPEM,
+		ClientKeyPEM:  clientKeyPEM,
+	})
+	if err == nil {
+		t.Fatal("expected signerTLSConfig to require root CA")
 	}
 }
 
@@ -51,7 +64,6 @@ func TestSignerTLSConfig_WithMTLS(t *testing.T) {
 
 	tlsConf, err := signerTLSConfig(RemoteSignerConfig{
 		ServerName:    "relay.internal",
-		EnableMTLS:    true,
 		RootCAPEM:     rootCAPEM,
 		ClientCertPEM: clientCertPEM,
 		ClientKeyPEM:  clientKeyPEM,
@@ -64,8 +76,86 @@ func TestSignerTLSConfig_WithMTLS(t *testing.T) {
 	}
 }
 
+func TestNewRemoteSigner_RequiresServerName(t *testing.T) {
+	rootCAPEM, _, err := testCertAndKeyPEM(true)
+	if err != nil {
+		t.Fatalf("create root CA cert: %v", err)
+	}
+	clientCertPEM, clientKeyPEM, err := testCertAndKeyPEM(false)
+	if err != nil {
+		t.Fatalf("create client cert: %v", err)
+	}
+	serverCertPEM, _, err := testCertAndKeyPEMWithCN("relay.internal", false)
+	if err != nil {
+		t.Fatalf("create server cert: %v", err)
+	}
+
+	_, err = NewRemoteSigner(RemoteSignerConfig{
+		Endpoint:      "relay.internal:9443",
+		KeyID:         "relay-cert",
+		RootCAPEM:     rootCAPEM,
+		ClientCertPEM: clientCertPEM,
+		ClientKeyPEM:  clientKeyPEM,
+	}, serverCertPEM)
+	if err == nil {
+		t.Fatal("expected NewRemoteSigner to require server name")
+	}
+}
+
+func TestNewRemoteSigner_RequiresMTLSRootsAndClientMaterial(t *testing.T) {
+	rootCAPEM, _, err := testCertAndKeyPEM(true)
+	if err != nil {
+		t.Fatalf("create root CA cert: %v", err)
+	}
+	clientCertPEM, clientKeyPEM, err := testCertAndKeyPEM(false)
+	if err != nil {
+		t.Fatalf("create client cert: %v", err)
+	}
+	serverCertPEM, _, err := testCertAndKeyPEMWithCN("relay.internal", false)
+	if err != nil {
+		t.Fatalf("create server cert: %v", err)
+	}
+
+	_, err = NewRemoteSigner(RemoteSignerConfig{
+		Endpoint:   "relay.internal:9443",
+		ServerName: "relay.internal",
+		KeyID:      "relay-cert",
+		// intentionally omit RootCAPEM
+		ClientCertPEM: clientCertPEM,
+		ClientKeyPEM:  clientKeyPEM,
+	}, serverCertPEM)
+	if err == nil {
+		t.Fatal("expected NewRemoteSigner to require root CA")
+	}
+
+	_, err = NewRemoteSigner(RemoteSignerConfig{
+		Endpoint:     "relay.internal:9443",
+		ServerName:   "relay.internal",
+		KeyID:        "relay-cert",
+		RootCAPEM:    rootCAPEM,
+		ClientKeyPEM: clientKeyPEM,
+	}, serverCertPEM)
+	if err == nil {
+		t.Fatal("expected NewRemoteSigner to require client certificate")
+	}
+
+	_, err = NewRemoteSigner(RemoteSignerConfig{
+		Endpoint:      "relay.internal:9443",
+		ServerName:    "relay.internal",
+		KeyID:         "relay-cert",
+		RootCAPEM:     rootCAPEM,
+		ClientCertPEM: clientCertPEM,
+	}, serverCertPEM)
+	if err == nil {
+		t.Fatal("expected NewRemoteSigner to require client key")
+	}
+}
+
 func TestSignEndpoint_DefaultsToHTTPS(t *testing.T) {
-	got := signEndpoint("127.0.0.1:9443")
+	got, err := signEndpoint("127.0.0.1:9443")
+	if err != nil {
+		t.Fatalf("signEndpoint() error = %v", err)
+	}
 	want := "https://127.0.0.1:9443" + signrpc.SignPath
 	if got != want {
 		t.Fatalf("signEndpoint() = %q, want %q", got, want)
@@ -73,10 +163,39 @@ func TestSignEndpoint_DefaultsToHTTPS(t *testing.T) {
 }
 
 func TestSignEndpoint_WithScheme(t *testing.T) {
-	got := signEndpoint("https://relay.internal:9443/")
+	got, err := signEndpoint("https://relay.internal:9443/")
+	if err != nil {
+		t.Fatalf("signEndpoint() error = %v", err)
+	}
 	want := "https://relay.internal:9443" + signrpc.SignPath
 	if got != want {
 		t.Fatalf("signEndpoint() = %q, want %q", got, want)
+	}
+}
+
+func TestSignEndpoint_RejectsNonHTTPS(t *testing.T) {
+	_, err := signEndpoint("http://127.0.0.1:9443")
+	if err == nil {
+		t.Fatal("expected signEndpoint to reject non-https endpoint")
+	}
+}
+
+func TestSignEndpoint_RejectsPath(t *testing.T) {
+	_, err := signEndpoint("https://relay.internal:9443/v1/sign")
+	if err == nil {
+		t.Fatal("expected signEndpoint to reject endpoint with path")
+	}
+
+	_, err = signEndpoint("relay.internal:9443/v1/sign")
+	if err == nil {
+		t.Fatal("expected signEndpoint to reject endpoint with path")
+	}
+}
+
+func TestSignEndpoint_RejectsQueryOrFragment(t *testing.T) {
+	_, err := signEndpoint("https://relay.internal:9443?x=1")
+	if err == nil {
+		t.Fatal("expected signEndpoint to reject query")
 	}
 }
 
@@ -84,6 +203,10 @@ func TestRemoteSignerSign_HTTPJSON(t *testing.T) {
 	serverCertPEM, serverKeyPEM, err := testCertAndKeyPEMWithCN("relay.internal", false)
 	if err != nil {
 		t.Fatalf("create server cert: %v", err)
+	}
+	clientCertPEM, clientKeyPEM, err := testCertAndKeyPEM(false)
+	if err != nil {
+		t.Fatalf("create client cert: %v", err)
 	}
 
 	mux := http.NewServeMux()
@@ -125,11 +248,13 @@ func TestRemoteSignerSign_HTTPJSON(t *testing.T) {
 
 	relayCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]})
 	rSigner, err := NewRemoteSigner(RemoteSignerConfig{
-		Endpoint:   strings.TrimPrefix(ts.URL, "https://"),
-		ServerName: "relay.internal",
-		KeyID:      "relay-cert",
-		RootCAPEM:  relayCertPEM,
-		Timeout:    2 * time.Second,
+		Endpoint:      strings.TrimPrefix(ts.URL, "https://"),
+		ServerName:    "relay.internal",
+		KeyID:         "relay-cert",
+		RootCAPEM:     relayCertPEM,
+		ClientCertPEM: clientCertPEM,
+		ClientKeyPEM:  clientKeyPEM,
+		Timeout:       2 * time.Second,
 	}, relayCertPEM)
 	if err != nil {
 		t.Fatalf("NewRemoteSigner() error = %v", err)
@@ -155,6 +280,10 @@ func TestRemoteSignerSign_HTTPError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create server cert: %v", err)
 	}
+	clientCertPEM, clientKeyPEM, err := testCertAndKeyPEM(false)
+	if err != nil {
+		t.Fatalf("create client cert: %v", err)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(signrpc.SignPath, func(w http.ResponseWriter, r *http.Request) {
@@ -174,11 +303,13 @@ func TestRemoteSignerSign_HTTPError(t *testing.T) {
 
 	relayCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]})
 	rSigner, err := NewRemoteSigner(RemoteSignerConfig{
-		Endpoint:   strings.TrimPrefix(ts.URL, "https://"),
-		ServerName: "relay.internal",
-		KeyID:      "relay-cert",
-		RootCAPEM:  relayCertPEM,
-		Timeout:    2 * time.Second,
+		Endpoint:      strings.TrimPrefix(ts.URL, "https://"),
+		ServerName:    "relay.internal",
+		KeyID:         "relay-cert",
+		RootCAPEM:     relayCertPEM,
+		ClientCertPEM: clientCertPEM,
+		ClientKeyPEM:  clientKeyPEM,
+		Timeout:       2 * time.Second,
 	}, relayCertPEM)
 	if err != nil {
 		t.Fatalf("NewRemoteSigner() error = %v", err)

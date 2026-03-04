@@ -18,7 +18,6 @@ import (
 func main() {
 	var (
 		listenAddr         = flag.String("listen", ":443", "public relay listen address")
-		upstream           = flag.String("upstream", "", "legacy single upstream address (used when -route is empty)")
 		defaultUpstream    = flag.String("default-upstream", "", "fallback upstream when SNI route is missing")
 		dialTimeout        = flag.Duration("dial-timeout", 3*time.Second, "upstream dial timeout")
 		clientHelloTimeout = flag.Duration("clienthello-timeout", 2*time.Second, "TLS ClientHello inspect timeout")
@@ -37,21 +36,7 @@ func main() {
 	}
 
 	if len(routes) == 0 {
-		if *upstream == "" {
-			log.Fatal("either -upstream or at least one -route is required")
-		}
-		proxy := &l4.Proxy{
-			ListenAddr: *listenAddr,
-			DialTimeout: func(ctx context.Context) (net.Conn, error) {
-				return dialFn(ctx, *upstream)
-			},
-		}
-
-		log.Printf("l4 relay listening on %s, upstream %s", *listenAddr, *upstream)
-		if err := proxy.Serve(ctx); err != nil {
-			log.Fatalf("l4 relay exited: %v", err)
-		}
-		return
+		log.Fatal("at least one -route is required")
 	}
 
 	proxy := &l4.Proxy{

@@ -16,7 +16,6 @@ func main() {
 		signerAddr     = flag.String("signer-addr", "", "HTTPS signer address (host:port or https://host:port)")
 		signerName     = flag.String("signer-name", "", "TLS server name for signer")
 		keyID          = flag.String("key-id", "default", "remote key identifier")
-		enableMTLS     = flag.Bool("enable-mtls", false, "enable client certificate for signer mTLS")
 		clientCertPath = flag.String("client-cert", "", "client cert PEM path for signer mTLS")
 		clientKeyPath  = flag.String("client-key", "", "client key PEM path for signer mTLS")
 		rootCAPath     = flag.String("root-ca", "", "signer root CA PEM path")
@@ -27,22 +26,17 @@ func main() {
 	required(*signerAddr, "signer-addr")
 	required(*signerName, "signer-name")
 	required(*rootCAPath, "root-ca")
-	if *enableMTLS {
-		required(*clientCertPath, "client-cert")
-		required(*clientKeyPath, "client-key")
-	}
+	required(*clientCertPath, "client-cert")
+	required(*clientKeyPath, "client-key")
 
 	certPEM := mustRead(*certPath)
 	remoteSignerCfg := keyless.RemoteSignerConfig{
-		Endpoint:   *signerAddr,
-		ServerName: *signerName,
-		KeyID:      *keyID,
-		EnableMTLS: *enableMTLS,
-		RootCAPEM:  mustRead(*rootCAPath),
-	}
-	if *enableMTLS {
-		remoteSignerCfg.ClientCertPEM = mustRead(*clientCertPath)
-		remoteSignerCfg.ClientKeyPEM = mustRead(*clientKeyPath)
+		Endpoint:      *signerAddr,
+		ServerName:    *signerName,
+		KeyID:         *keyID,
+		ClientCertPEM: mustRead(*clientCertPath),
+		ClientKeyPEM:  mustRead(*clientKeyPath),
+		RootCAPEM:     mustRead(*rootCAPath),
 	}
 
 	rSigner, err := keyless.NewRemoteSigner(remoteSignerCfg, certPEM)

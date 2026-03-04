@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -35,8 +36,20 @@ func NewRemoteSigner(cfg RemoteSignerConfig, certPEM []byte) (*RemoteSigner, err
 	if cfg.Endpoint == "" {
 		return nil, errors.New("endpoint is required")
 	}
+	if cfg.ServerName == "" {
+		return nil, errors.New("server name is required")
+	}
 	if cfg.KeyID == "" {
 		return nil, errors.New("key id is required")
+	}
+	if len(cfg.RootCAPEM) == 0 {
+		return nil, errors.New("root CA PEM is required")
+	}
+	if len(cfg.ClientCertPEM) == 0 {
+		return nil, errors.New("client certificate PEM is required")
+	}
+	if len(cfg.ClientKeyPEM) == 0 {
+		return nil, errors.New("client key PEM is required")
 	}
 	if len(certPEM) == 0 {
 		return nil, errors.New("certificate PEM is required")
@@ -52,7 +65,10 @@ func NewRemoteSigner(cfg RemoteSignerConfig, certPEM []byte) (*RemoteSigner, err
 		return nil, err
 	}
 
-	endpoint := signEndpoint(cfg.Endpoint)
+	endpoint, err := signEndpoint(cfg.Endpoint)
+	if err != nil {
+		return nil, err
+	}
 	transport := &http.Transport{
 		TLSClientConfig:     tlsConf,
 		MaxIdleConns:        100,
@@ -71,6 +87,19 @@ func NewRemoteSigner(cfg RemoteSignerConfig, certPEM []byte) (*RemoteSigner, err
 }
 
 func signerTLSConfig(cfg RemoteSignerConfig) (*tls.Config, error) {
+	if cfg.ServerName == "" {
+		return nil, errors.New("server name is required")
+	}
+	if len(cfg.RootCAPEM) == 0 {
+		return nil, errors.New("root CA PEM is required")
+	}
+	if len(cfg.ClientCertPEM) == 0 {
+		return nil, errors.New("client certificate PEM is required")
+	}
+	if len(cfg.ClientKeyPEM) == 0 {
+		return nil, errors.New("client key PEM is required")
+	}
+
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(cfg.RootCAPEM) {
 		return nil, errors.New("failed to parse root CA PEM")
@@ -80,10 +109,6 @@ func signerTLSConfig(cfg RemoteSignerConfig) (*tls.Config, error) {
 		MinVersion: tls.VersionTLS13,
 		ServerName: cfg.ServerName,
 		RootCAs:    pool,
-	}
-
-	if !cfg.EnableMTLS {
-		return tlsConf, nil
 	}
 
 	clientCert, err := tls.X509KeyPair(cfg.ClientCertPEM, cfg.ClientKeyPEM)
@@ -168,11 +193,40 @@ func (s *RemoteSigner) Close() error {
 	return nil
 }
 
-func signEndpoint(endpoint string) string {
-	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
-		return strings.TrimRight(endpoint, "/") + signrpc.SignPath
+func signEndpoint(endpoint string) (string, error) {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return "", errors.New("endpoint is required")
 	}
-	return "https://" + strings.TrimRight(endpoint, "/") + signrpc.SignPath
+
+	if strings.HasPrefix(endpoint, "https://") || strings.HasPrefix(endpoint, "http://") {
+		parsed, err := url.Parse(endpoint)
+		if err != nil {
+			return "", fmt.Errorf("invalid endpoint: %w", err)
+		}
+		if parsed.Scheme != "https" {
+			return "", fmt.Errorf("endpoint must use https scheme: %s", parsed.Scheme)
+		}
+		if parsed.User != nil {
+			return "", errors.New("endpoint must not include user info")
+		}
+		if parsed.Path != "" && parsed.Path != "/" {
+			return "", errors.New("endpoint must not include a path")
+		}
+		if parsed.RawQuery != "" || parsed.Fragment != "" {
+			return "", errors.New("endpoint must not include query or fragment")
+		}
+		if parsed.Host == "" {
+			return "", errors.New("invalid endpoint host")
+		}
+		return strings.TrimRight("https://"+parsed.Host, "/") + signrpc.SignPath, nil
+	}
+
+	if strings.ContainsAny(endpoint, "/?#") {
+		return "", errors.New("endpoint must not include URL path, query, or fragment")
+	}
+
+	return "https://" + strings.TrimRight(endpoint, "/") + signrpc.SignPath, nil
 }
 
 func parsePublicKeyFromCert(certPEM []byte) (crypto.PublicKey, error) {

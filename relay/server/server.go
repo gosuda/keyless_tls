@@ -20,7 +20,6 @@ type Config struct {
 	ListenAddr    string
 	ServerCertPEM []byte
 	ServerKeyPEM  []byte
-	EnableMTLS    bool
 	ClientCAPEM   []byte
 	SignerService *signer.Service
 }
@@ -33,7 +32,7 @@ func ListenAndServe(ctx context.Context, cfg Config) error {
 		return errors.New("signer service is required")
 	}
 
-	tlsConf, err := serverTLSConfig(cfg.ServerCertPEM, cfg.ServerKeyPEM, cfg.ClientCAPEM, cfg.EnableMTLS)
+	tlsConf, err := serverTLSConfig(cfg.ServerCertPEM, cfg.ServerKeyPEM, cfg.ClientCAPEM)
 	if err != nil {
 		return err
 	}
@@ -106,7 +105,7 @@ func writeJSONError(w http.ResponseWriter, code int, message string) {
 	_ = json.NewEncoder(w).Encode(signrpc.ErrorResponse{Error: message})
 }
 
-func serverTLSConfig(certPEM, keyPEM, clientCAPEM []byte, enableMTLS bool) (*tls.Config, error) {
+func serverTLSConfig(certPEM, keyPEM, clientCAPEM []byte) (*tls.Config, error) {
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		return nil, fmt.Errorf("parse server key pair: %w", err)
@@ -115,11 +114,7 @@ func serverTLSConfig(certPEM, keyPEM, clientCAPEM []byte, enableMTLS bool) (*tls
 	tlsConf := &tls.Config{
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{cert},
-		ClientAuth:   tls.NoClientCert,
-	}
-
-	if !enableMTLS {
-		return tlsConf, nil
+		ClientAuth:   tls.RequireAndVerifyClientCert,
 	}
 
 	pool := x509.NewCertPool()
@@ -127,7 +122,6 @@ func serverTLSConfig(certPEM, keyPEM, clientCAPEM []byte, enableMTLS bool) (*tls
 		return nil, errors.New("failed to parse client CA PEM")
 	}
 
-	tlsConf.ClientAuth = tls.RequireAndVerifyClientCert
 	tlsConf.ClientCAs = pool
 
 	return tlsConf, nil

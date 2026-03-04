@@ -6,7 +6,6 @@ type RemoteSignerConfig struct {
 	Endpoint      string
 	ServerName    string
 	KeyID         string
-	EnableMTLS    bool
 	ClientCertPEM []byte
 	ClientKeyPEM  []byte
 	RootCAPEM     []byte

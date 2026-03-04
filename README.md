@@ -6,7 +6,7 @@
 
 - TLS engine, session keys, traffic crypto: `tunneling app`
 - TLS signing (`CertificateVerify`): remote `relay signer`
-- Signer transport: `HTTPS + JSON` by default, optional `mTLS`
+- Signer transport: `HTTPS + JSON` with mandatory `mTLS`
 
 This repository supports two usage modes:
 
@@ -66,9 +66,8 @@ func main() {
             ServerName: "relay.internal",
             KeyID:      "relay-cert",
             RootCAPEM:  mustRead("certs/relay-ca.crt"),
-            // EnableMTLS: true,
-            // ClientCertPEM: mustRead("certs/tunnel-client.crt"),
-            // ClientKeyPEM:  mustRead("certs/tunnel-client.key"),
+            ClientCertPEM: mustRead("certs/tunnel-client.crt"),
+            ClientKeyPEM:  mustRead("certs/tunnel-client.key"),
         },
     })
     if err != nil {
@@ -178,7 +177,7 @@ For a complete runnable SDK-style routing sample with 10 hosts, see `examples/re
 
 - Deploy only the public certificate chain (`cert PEM`) in the tunnel app
 - Configure signer endpoint/server name/`KeyID`/root CA
-- Enable mTLS if needed (`EnableMTLS`, client cert/key)
+- Provide mTLS client materials (`client cert/key`)
 - Call `remoteSigner.Close()` on shutdown
 
 ---
@@ -229,6 +228,8 @@ go run ./examples/tunnel-http \
   -signer-addr 127.0.0.1:9443 \
   -signer-name relay.internal \
   -key-id relay-cert \
+  -client-cert certs/tunnel-client.crt \
+  -client-key certs/tunnel-client.key \
   -root-ca certs/relay-ca.crt
 ```
 
@@ -237,7 +238,8 @@ go run ./examples/tunnel-http \
 ```bash
 go run ./cmd/relay-l4 \
   -listen :443 \
-  -upstream 127.0.0.1:8443
+  -route app1.example.com=127.0.0.1:8443 \
+  -default-upstream 127.0.0.1:8443
 ```
 
 SNI route mode (`-route` can be repeated):
@@ -308,10 +310,9 @@ Important flags for `examples/relay-10-targets`:
 - `-dial-timeout`: upstream dial timeout
 - `-clienthello-timeout`: ClientHello inspection timeout
 
-### Protect signer with mTLS
+### mTLS is required for signer transport
 
-Default mode is server-authenticated TLS.
-To require client authentication as well, enable and align mTLS options on both signer and tunnel app.
+Signer and tunnel clients must always be configured for mutual TLS.
 
 ```bash
 go run ./cmd/relay-signer \
@@ -319,7 +320,6 @@ go run ./cmd/relay-signer \
   -key-id relay-cert \
   -tls-cert certs/relay-server.crt \
   -tls-key certs/relay-server.key \
-  -enable-mtls \
   -client-ca certs/client-ca.crt \
   -sign-key certs/relay-signing.key
 
@@ -329,7 +329,6 @@ go run ./examples/tunnel-http \
   -signer-addr 127.0.0.1:9443 \
   -signer-name relay.internal \
   -key-id relay-cert \
-  -enable-mtls \
   -client-cert certs/tunnel-client.crt \
   -client-key certs/tunnel-client.key \
   -root-ca certs/relay-ca.crt
@@ -341,7 +340,7 @@ go run ./examples/tunnel-http \
 
 - Store private keys only in `relay-signer`; never distribute them to tunnel apps
 - Keep only the public certificate chain in tunnel apps
-- Protect signer with at least TLS server auth; prefer mTLS + `KeyID`-scoped ACLs where possible
+- Enforce signer mTLS and pair it with `KeyID`-scoped ACLs
 
 ## Package structure
 
@@ -349,7 +348,7 @@ go run ./examples/tunnel-http \
 - `keyless/signerclient`: remote signer client implementation
 - `relay/signrpc`: signer JSON request/response types
 - `relay/signer`: signing service/key store
-- `relay/server`: signer HTTPS (TLS/mTLS) server launcher
+- `relay/server`: signer HTTPS (mandatory mTLS) server launcher
 - `relay/l4`: TCP passthrough relay + optional ClientHello (SNI/ALPN) inspection hook
 
 ## Current status

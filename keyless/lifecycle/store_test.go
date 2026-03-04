@@ -12,7 +12,7 @@ func TestDiskStoreSaveLoadAndPerms(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	store, err := NewDiskStore(dir, bytesRepeat(0x19, 32))
+	store, err := NewDiskStore(dir, repeatBytes(0x19, 32))
 	if err != nil {
 		t.Fatalf("new disk store: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestDiskStoreCorruptionMarking(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	store, err := NewDiskStore(dir, bytesRepeat(0x29, 32))
+	store, err := NewDiskStore(dir, repeatBytes(0x29, 32))
 	if err != nil {
 		t.Fatalf("new disk store: %v", err)
 	}
@@ -97,10 +97,18 @@ func TestDiskStoreCorruptionMarking(t *testing.T) {
 func TestDiskStoreRequiresValidInputs(t *testing.T) {
 	t.Parallel()
 
-	if _, err := NewDiskStore("", bytesRepeat(0x30, 32)); !errors.Is(err, ErrInvalidRequest) {
+	if _, err := NewDiskStore("", repeatBytes(0x30, 32)); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("expected invalid request for empty dir, got %v", err)
 	}
 	if _, err := NewDiskStore(t.TempDir(), []byte("short")); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("expected invalid request for short key, got %v", err)
 	}
+}
+
+func repeatBytes(v byte, n int) []byte {
+	out := make([]byte, n)
+	for i := range out {
+		out[i] = v
+	}
+	return out
 }

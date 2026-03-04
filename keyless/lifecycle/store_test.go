@@ -8,70 +8,99 @@ import (
 	"time"
 )
 
-func TestDiskStorePersistence(t *testing.T) {
+func TestDiskStoreSaveLoadAndPerms(t *testing.T) {
+	t.Parallel()
+
 	dir := t.TempDir()
-	store, err := NewDiskStore(dir, bytesRepeat(0x11, 32))
+	store, err := NewDiskStore(dir, bytesRepeat(0x19, 32))
 	if err != nil {
-		t.Fatalf("create store: %v", err)
+		t.Fatalf("new disk store: %v", err)
 	}
+
 	state := &leaseState{
-		LeaseID:         "persist",
-		KeyID:           "node-x",
-		BoundTo:         "service",
-		CertPEM:         []byte("cert"),
-		CertFingerprint: "fp",
-		IssuedAt:        time.Now(),
-		NotBefore:       time.Now(),
-		NotAfter:        time.Now().Add(time.Hour),
-		OverlapGrace:    5 * time.Minute,
+		LeaseID: "lease-store",
+		Current: IdentityBundle{
+			LeaseID:   "lease-store",
+			CertPEM:   []byte("cert"),
+			KeyPEM:    []byte("key"),
+			ChainPEM:  []byte("chain"),
+			Epoch:     1,
+			NotBefore: time.Now().Add(-time.Minute),
+			NotAfter:  time.Now().Add(time.Hour),
+		},
+		UpdatedAt: time.Now(),
 	}
 	if err := store.Save(context.Background(), state); err != nil {
-		t.Fatalf("save: %v", err)
+		t.Fatalf("save state: %v", err)
 	}
-	info, err := os.Stat(store.pathForKey("node-x"))
+
+	path := store.pathForLease("lease-store")
+	info, err := os.Stat(path)
 	if err != nil {
-		t.Fatalf("stat file: %v", err)
+		t.Fatalf("stat state file: %v", err)
 	}
 	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("unexpected perms: %o", info.Mode().Perm())
+		t.Fatalf("state file perms=%v want=0600", info.Mode().Perm())
 	}
-	loaded, err := store.Load(context.Background(), "node-x")
+
+	loaded, err := store.Load(context.Background(), "lease-store")
 	if err != nil {
-		t.Fatalf("load: %v", err)
+		t.Fatalf("load state: %v", err)
 	}
-	if loaded.LeaseID != state.LeaseID {
-		t.Fatalf("lease id: got %s", loaded.LeaseID)
+	if loaded.LeaseID != "lease-store" {
+		t.Fatalf("lease mismatch: got=%q", loaded.LeaseID)
+	}
+	if loaded.Current.Epoch != 1 {
+		t.Fatalf("epoch mismatch: got=%d", loaded.Current.Epoch)
 	}
 }
 
-func TestDiskStoreCorruption(t *testing.T) {
+func TestDiskStoreCorruptionMarking(t *testing.T) {
+	t.Parallel()
+
 	dir := t.TempDir()
-	store, err := NewDiskStore(dir, bytesRepeat(0x22, 32))
+	store, err := NewDiskStore(dir, bytesRepeat(0x29, 32))
 	if err != nil {
-		t.Fatalf("create store: %v", err)
+		t.Fatalf("new disk store: %v", err)
 	}
+
 	state := &leaseState{
-		LeaseID:         "corrupt",
-		KeyID:           "node-y",
-		BoundTo:         "service",
-		CertPEM:         []byte("cert"),
-		CertFingerprint: "fp",
-		IssuedAt:        time.Now(),
-		NotBefore:       time.Now(),
-		NotAfter:        time.Now().Add(time.Hour),
-		OverlapGrace:    5 * time.Minute,
+		LeaseID: "lease-corrupt",
+		Current: IdentityBundle{
+			LeaseID:   "lease-corrupt",
+			CertPEM:   []byte("cert"),
+			KeyPEM:    []byte("key"),
+			ChainPEM:  []byte("chain"),
+			Epoch:     3,
+			NotBefore: time.Now().Add(-time.Minute),
+			NotAfter:  time.Now().Add(time.Hour),
+		},
+		UpdatedAt: time.Now(),
 	}
 	if err := store.Save(context.Background(), state); err != nil {
-		t.Fatalf("save: %v", err)
+		t.Fatalf("save state: %v", err)
 	}
-	path := store.pathForKey("node-y")
-	if err := os.WriteFile(path, []byte("bad"), 0o600); err != nil {
-		t.Fatalf("overwrite: %v", err)
+
+	path := store.pathForLease("lease-corrupt")
+	if err := os.WriteFile(path, []byte("broken"), 0o600); err != nil {
+		t.Fatalf("overwrite file: %v", err)
 	}
-	if _, err := store.Load(context.Background(), "node-y"); !errors.Is(err, ErrLeaseCorrupted) {
-		t.Fatalf("expected corruption: %v", err)
+
+	if _, err := store.Load(context.Background(), "lease-corrupt"); !errors.Is(err, ErrCorruptStore) {
+		t.Fatalf("expected corrupt error, got %v", err)
 	}
 	if _, err := os.Stat(path + ".corrupt"); err != nil {
-		t.Fatalf("corrupt marker missing: %v", err)
+		t.Fatalf("expected corrupt marker file: %v", err)
+	}
+}
+
+func TestDiskStoreRequiresValidInputs(t *testing.T) {
+	t.Parallel()
+
+	if _, err := NewDiskStore("", bytesRepeat(0x30, 32)); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("expected invalid request for empty dir, got %v", err)
+	}
+	if _, err := NewDiskStore(t.TempDir(), []byte("short")); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("expected invalid request for short key, got %v", err)
 	}
 }

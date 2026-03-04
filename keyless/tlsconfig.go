@@ -14,6 +14,15 @@ type ServerTLSConfig struct {
 	Signer     crypto.Signer
 	NextProtos []string
 	MinVersion uint16
+
+	// ClientCAs is an optional CA pool for verifying client certificates.
+	// When non-nil, ClientAuth must also be set to a value that requests
+	// or requires client certs; otherwise the pool is ignored by crypto/tls.
+	ClientCAs *x509.CertPool
+	// ClientAuth controls whether the server requests/requires a client
+	// certificate. Zero value (tls.NoClientCert) preserves backward
+	// compatibility.
+	ClientAuth tls.ClientAuthType
 }
 
 func NewServerTLSConfig(cfg ServerTLSConfig) (*tls.Config, error) {
@@ -38,6 +47,8 @@ func NewServerTLSConfig(cfg ServerTLSConfig) (*tls.Config, error) {
 		MinVersion:   minVersion,
 		Certificates: []tls.Certificate{cert},
 		NextProtos:   cfg.NextProtos,
+		ClientCAs:    cfg.ClientCAs,
+		ClientAuth:   cfg.ClientAuth,
 	}
 
 	if len(tlsConf.NextProtos) == 0 {

@@ -81,4 +81,3 @@ func TestNewClientTLSConfig_EmptyServerName(t *testing.T) {
 		t.Fatalf("expected empty ServerName, got %q", tlsConf.ServerName)
 	}
 }
-

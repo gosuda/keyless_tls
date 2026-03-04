@@ -1,7 +1,10 @@
 package keyless
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"fmt"
 	"net/http"
 )
 
@@ -11,6 +14,17 @@ type HTTPServerAttachConfig struct {
 	NextProtos       []string
 	MinTLSVersion    uint16
 	PreserveExisting bool
+
+	// ClientCAPEM is PEM-encoded CA certificate(s) for verifying client certs.
+	// When set, the server will request (or require) client certificates
+	// depending on RequireClientCert.
+	ClientCAPEM []byte
+	// RequireClientCert controls the client auth policy when ClientCAPEM is
+	// provided:
+	//   true  → tls.RequireAndVerifyClientCert
+	//   false → tls.VerifyClientCertIfGiven
+	// Ignored when ClientCAPEM is empty.
+	RequireClientCert bool
 }
 
 func AttachToHTTPServer(server *http.Server, cfg HTTPServerAttachConfig) (*RemoteSigner, error) {
@@ -23,11 +37,30 @@ func AttachToHTTPServer(server *http.Server, cfg HTTPServerAttachConfig) (*Remot
 		return nil, err
 	}
 
+	// Resolve client-auth settings from the convenience PEM/bool fields.
+	var clientCAs *x509.CertPool
+	var clientAuth tls.ClientAuthType
+
+	if len(cfg.ClientCAPEM) > 0 {
+		clientCAs = x509.NewCertPool()
+		if !clientCAs.AppendCertsFromPEM(cfg.ClientCAPEM) {
+			_ = remoteSigner.Close()
+			return nil, fmt.Errorf("failed to parse client CA PEM")
+		}
+		if cfg.RequireClientCert {
+			clientAuth = tls.RequireAndVerifyClientCert
+		} else {
+			clientAuth = tls.VerifyClientCertIfGiven
+		}
+	}
+
 	tlsConf, err := NewServerTLSConfig(ServerTLSConfig{
 		CertPEM:    cfg.CertPEM,
 		Signer:     remoteSigner,
 		NextProtos: cfg.NextProtos,
 		MinVersion: cfg.MinTLSVersion,
+		ClientCAs:  clientCAs,
+		ClientAuth: clientAuth,
 	})
 	if err != nil {
 		_ = remoteSigner.Close()
@@ -41,6 +74,10 @@ func AttachToHTTPServer(server *http.Server, cfg HTTPServerAttachConfig) (*Remot
 		}
 		if len(server.TLSConfig.NextProtos) == 0 {
 			server.TLSConfig.NextProtos = tlsConf.NextProtos
+		}
+		if tlsConf.ClientCAs != nil {
+			server.TLSConfig.ClientCAs = tlsConf.ClientCAs
+			server.TLSConfig.ClientAuth = tlsConf.ClientAuth
 		}
 	} else {
 		server.TLSConfig = tlsConf

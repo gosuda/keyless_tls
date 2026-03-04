@@ -69,6 +69,7 @@ func signHandler(service *signer.Service) http.Handler {
 			return
 		}
 
+		r.Body = http.MaxBytesReader(w, r.Body, 4<<10) // 4 KiB
 		defer r.Body.Close()
 		var req signrpc.SignRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -114,15 +115,17 @@ func serverTLSConfig(certPEM, keyPEM, clientCAPEM []byte) (*tls.Config, error) {
 	tlsConf := &tls.Config{
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{cert},
-		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientAuth:   tls.NoClientCert, // overridden below when client CA is provided
 	}
 
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(clientCAPEM) {
-		return nil, errors.New("failed to parse client CA PEM")
+	if len(clientCAPEM) > 0 {
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(clientCAPEM) {
+			return nil, errors.New("failed to parse client CA PEM")
+		}
+		tlsConf.ClientAuth = tls.RequireAndVerifyClientCert
+		tlsConf.ClientCAs = pool
 	}
-
-	tlsConf.ClientCAs = pool
 
 	return tlsConf, nil
 }

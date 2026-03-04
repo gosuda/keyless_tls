@@ -54,13 +54,9 @@ func buildTenRoutes(upstreamHost string, basePort int, domain string) map[string
 	for i := 1; i <= 10; i++ {
 		host := fmt.Sprintf("app%d.%s", i, domain)
 		addr := net.JoinHostPort(upstreamHost, strconv.Itoa(basePort+i-1))
-		routes[normalizeHost(host)] = addr
+		routes[l4.NormalizeServerName(host)] = addr
 	}
 	return routes
-}
-
-func normalizeHost(host string) string {
-	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
 }
 
 func selectUpstream(routes map[string]string, defaultUpstream string, info l4.ClientHelloInfo, parseErr error) (string, error) {
@@ -71,7 +67,7 @@ func selectUpstream(routes map[string]string, defaultUpstream string, info l4.Cl
 		return defaultUpstream, nil
 	}
 
-	if addr, ok := routes[normalizeHost(info.ServerName)]; ok {
+	if addr, ok := routes[l4.NormalizeServerName(info.ServerName)]; ok {
 		return addr, nil
 	}
 	if defaultUpstream != "" {

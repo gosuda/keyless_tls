@@ -148,7 +148,7 @@ func parseClientHelloRecord(recordBody []byte) (ClientHelloInfo, error) {
 		switch extType {
 		case extServerName:
 			if name := parseServerNameExtension(extData); name != "" {
-				info.ServerName = normalizeServerName(name)
+				info.ServerName = NormalizeServerName(name)
 			}
 		case extALPN:
 			info.ALPNProtocols = parseALPNExtension(extData)
@@ -213,7 +213,8 @@ func parseALPNExtension(ext []byte) []string {
 	return protos
 }
 
-func normalizeServerName(serverName string) string {
+// NormalizeServerName applies canonical SNI normalization: lowercase, trim whitespace, strip trailing dot.
+func NormalizeServerName(serverName string) string {
 	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(serverName)), ".")
 }
 

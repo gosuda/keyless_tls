@@ -42,14 +42,10 @@ func NewRemoteSigner(cfg RemoteSignerConfig, certPEM []byte) (*RemoteSigner, err
 	if cfg.KeyID == "" {
 		return nil, errors.New("key id is required")
 	}
-	if len(cfg.RootCAPEM) == 0 {
-		return nil, errors.New("root CA PEM is required")
-	}
-	if len(cfg.ClientCertPEM) == 0 {
-		return nil, errors.New("client certificate PEM is required")
-	}
-	if len(cfg.ClientKeyPEM) == 0 {
-		return nil, errors.New("client key PEM is required")
+	hasCert := len(cfg.ClientCertPEM) > 0
+	hasKey := len(cfg.ClientKeyPEM) > 0
+	if hasCert != hasKey {
+		return nil, errors.New("client certificate and key must both be provided or both be empty")
 	}
 	if len(certPEM) == 0 {
 		return nil, errors.New("certificate PEM is required")
@@ -90,32 +86,33 @@ func signerTLSConfig(cfg RemoteSignerConfig) (*tls.Config, error) {
 	if cfg.ServerName == "" {
 		return nil, errors.New("server name is required")
 	}
-	if len(cfg.RootCAPEM) == 0 {
-		return nil, errors.New("root CA PEM is required")
-	}
-	if len(cfg.ClientCertPEM) == 0 {
-		return nil, errors.New("client certificate PEM is required")
-	}
-	if len(cfg.ClientKeyPEM) == 0 {
-		return nil, errors.New("client key PEM is required")
-	}
 
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(cfg.RootCAPEM) {
-		return nil, errors.New("failed to parse root CA PEM")
+	hasCert := len(cfg.ClientCertPEM) > 0
+	hasKey := len(cfg.ClientKeyPEM) > 0
+	if hasCert != hasKey {
+		return nil, errors.New("client certificate and key must both be provided or both be empty")
 	}
 
 	tlsConf := &tls.Config{
 		MinVersion: tls.VersionTLS13,
 		ServerName: cfg.ServerName,
-		RootCAs:    pool,
 	}
 
-	clientCert, err := tls.X509KeyPair(cfg.ClientCertPEM, cfg.ClientKeyPEM)
-	if err != nil {
-		return nil, fmt.Errorf("load client key pair: %w", err)
+	if len(cfg.RootCAPEM) > 0 {
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(cfg.RootCAPEM) {
+			return nil, errors.New("failed to parse root CA PEM")
+		}
+		tlsConf.RootCAs = pool
 	}
-	tlsConf.Certificates = []tls.Certificate{clientCert}
+
+	if hasCert {
+		clientCert, err := tls.X509KeyPair(cfg.ClientCertPEM, cfg.ClientKeyPEM)
+		if err != nil {
+			return nil, fmt.Errorf("load client key pair: %w", err)
+		}
+		tlsConf.Certificates = []tls.Certificate{clientCert}
+	}
 
 	return tlsConf, nil
 }

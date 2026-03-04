@@ -25,18 +25,21 @@ func main() {
 	required(*certPath, "cert")
 	required(*signerAddr, "signer-addr")
 	required(*signerName, "signer-name")
-	required(*rootCAPath, "root-ca")
-	required(*clientCertPath, "client-cert")
-	required(*clientKeyPath, "client-key")
 
 	certPEM := mustRead(*certPath)
 	remoteSignerCfg := keyless.RemoteSignerConfig{
-		Endpoint:      *signerAddr,
-		ServerName:    *signerName,
-		KeyID:         *keyID,
-		ClientCertPEM: mustRead(*clientCertPath),
-		ClientKeyPEM:  mustRead(*clientKeyPath),
-		RootCAPEM:     mustRead(*rootCAPath),
+		Endpoint:   *signerAddr,
+		ServerName: *signerName,
+		KeyID:      *keyID,
+	}
+	if *clientCertPath != "" {
+		remoteSignerCfg.ClientCertPEM = mustRead(*clientCertPath)
+	}
+	if *clientKeyPath != "" {
+		remoteSignerCfg.ClientKeyPEM = mustRead(*clientKeyPath)
+	}
+	if *rootCAPath != "" {
+		remoteSignerCfg.RootCAPEM = mustRead(*rootCAPath)
 	}
 
 	rSigner, err := keyless.NewRemoteSigner(remoteSignerCfg, certPEM)

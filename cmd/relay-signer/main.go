@@ -26,11 +26,16 @@ func main() {
 	required(*certPath, "tls-cert")
 	required(*keyPath, "tls-key")
 	required(*signKey, "sign-key")
-	required(*clientCA, "client-ca")
+	if *clientCA == "" {
+		log.Println("WARNING: -client-ca not set, mTLS client verification disabled")
+	}
 
 	certPEM := mustRead(*certPath)
 	keyPEM := mustRead(*keyPath)
-	caPEM := mustRead(*clientCA)
+	var caPEM []byte
+	if *clientCA != "" {
+		caPEM = mustRead(*clientCA)
+	}
 	signKeyPEM := mustRead(*signKey)
 
 	signingKey, err := signer.ParsePrivateKeyPEM(signKeyPEM)

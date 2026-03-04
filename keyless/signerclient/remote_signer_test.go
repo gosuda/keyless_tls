@@ -2,62 +2,27 @@ package signerclient
 
 import (
 	"crypto"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
 	"io"
-	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gosuda/keyless_tls/internal/testutil"
 	"github.com/gosuda/keyless_tls/relay/signrpc"
 )
 
-func TestSignerTLSConfig_RequiresClientCertificate(t *testing.T) {
-	rootCAPEM, _, err := testCertAndKeyPEM(true)
-	if err != nil {
-		t.Fatalf("create root CA cert: %v", err)
-	}
-
-	_, err = signerTLSConfig(RemoteSignerConfig{
-		ServerName: "relay.internal",
-		RootCAPEM:  rootCAPEM,
-	})
-	if err == nil {
-		t.Fatal("expected signerTLSConfig to require client certificate")
-	}
-}
-
-func TestSignerTLSConfig_RequiresRootCA(t *testing.T) {
-	clientCertPEM, clientKeyPEM, err := testCertAndKeyPEM(false)
-	if err != nil {
-		t.Fatalf("create client cert: %v", err)
-	}
-
-	_, err = signerTLSConfig(RemoteSignerConfig{
-		ServerName:    "relay.internal",
-		ClientCertPEM: clientCertPEM,
-		ClientKeyPEM:  clientKeyPEM,
-	})
-	if err == nil {
-		t.Fatal("expected signerTLSConfig to require root CA")
-	}
-}
-
 func TestSignerTLSConfig_WithMTLS(t *testing.T) {
-	rootCAPEM, _, err := testCertAndKeyPEM(true)
+	rootCAPEM, _, err := testutil.GenerateCert("test.local", true)
 	if err != nil {
 		t.Fatalf("create root CA cert: %v", err)
 	}
-	clientCertPEM, clientKeyPEM, err := testCertAndKeyPEM(false)
+	clientCertPEM, clientKeyPEM, err := testutil.GenerateCert("test.local", false)
 	if err != nil {
 		t.Fatalf("create client cert: %v", err)
 	}
@@ -74,18 +39,87 @@ func TestSignerTLSConfig_WithMTLS(t *testing.T) {
 	if len(tlsConf.Certificates) != 1 {
 		t.Fatalf("expected one client certificate, got %d", len(tlsConf.Certificates))
 	}
+	if tlsConf.RootCAs == nil {
+		t.Fatal("expected RootCAs to be set when mTLS is enabled")
+	}
 }
 
-func TestNewRemoteSigner_RequiresServerName(t *testing.T) {
-	rootCAPEM, _, err := testCertAndKeyPEM(true)
+func TestSignerTLSConfig_WithoutMTLS(t *testing.T) {
+	tlsConf, err := signerTLSConfig(RemoteSignerConfig{
+		ServerName: "relay.internal",
+	})
 	if err != nil {
-		t.Fatalf("create root CA cert: %v", err)
+		t.Fatalf("signerTLSConfig() error = %v", err)
 	}
-	clientCertPEM, clientKeyPEM, err := testCertAndKeyPEM(false)
+	if len(tlsConf.Certificates) != 0 {
+		t.Fatalf("expected no client certificates, got %d", len(tlsConf.Certificates))
+	}
+	if tlsConf.RootCAs != nil {
+		t.Fatal("expected RootCAs to be nil (system pool) when no RootCAPEM provided")
+	}
+}
+
+func TestSignerTLSConfig_PartialClientMaterial(t *testing.T) {
+	clientCertPEM, clientKeyPEM, err := testutil.GenerateCert("test.local", false)
 	if err != nil {
 		t.Fatalf("create client cert: %v", err)
 	}
-	serverCertPEM, _, err := testCertAndKeyPEMWithCN("relay.internal", false)
+
+	// cert without key
+	_, err = signerTLSConfig(RemoteSignerConfig{
+		ServerName:    "relay.internal",
+		ClientCertPEM: clientCertPEM,
+	})
+	if err == nil {
+		t.Fatal("expected error when client cert is provided without key")
+	}
+
+	// key without cert
+	_, err = signerTLSConfig(RemoteSignerConfig{
+		ServerName:   "relay.internal",
+		ClientKeyPEM: clientKeyPEM,
+	})
+	if err == nil {
+		t.Fatal("expected error when client key is provided without cert")
+	}
+}
+
+func TestSignerTLSConfig_InvalidRootCAPEM(t *testing.T) {
+	_, err := signerTLSConfig(RemoteSignerConfig{
+		ServerName: "relay.internal",
+		RootCAPEM:  []byte("not-valid-pem"),
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid root CA PEM")
+	}
+}
+
+func TestSignerTLSConfig_InvalidClientCertPEM(t *testing.T) {
+	_, clientKeyPEM, err := testutil.GenerateCert("test.local", false)
+	if err != nil {
+		t.Fatalf("create client key: %v", err)
+	}
+
+	_, err = signerTLSConfig(RemoteSignerConfig{
+		ServerName:    "relay.internal",
+		ClientCertPEM: []byte("not-valid-cert"),
+		ClientKeyPEM:  clientKeyPEM,
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid client cert PEM")
+	}
+}
+
+func TestNewRemoteSigner_RequiresServerName(t *testing.T) {
+	rootCAPEM, _, err := testutil.GenerateCert("test.local", true)
+	if err != nil {
+		t.Fatalf("create root CA cert: %v", err)
+	}
+	clientCertPEM, clientKeyPEM, err := testutil.GenerateCert("test.local", false)
+	if err != nil {
+		t.Fatalf("create client cert: %v", err)
+	}
+	serverCertPEM, _, err := testutil.GenerateCert("relay.internal", false)
 	if err != nil {
 		t.Fatalf("create server cert: %v", err)
 	}
@@ -102,53 +136,21 @@ func TestNewRemoteSigner_RequiresServerName(t *testing.T) {
 	}
 }
 
-func TestNewRemoteSigner_RequiresMTLSRootsAndClientMaterial(t *testing.T) {
-	rootCAPEM, _, err := testCertAndKeyPEM(true)
-	if err != nil {
-		t.Fatalf("create root CA cert: %v", err)
-	}
-	clientCertPEM, clientKeyPEM, err := testCertAndKeyPEM(false)
-	if err != nil {
-		t.Fatalf("create client cert: %v", err)
-	}
-	serverCertPEM, _, err := testCertAndKeyPEMWithCN("relay.internal", false)
+func TestNewRemoteSigner_WithoutMTLS(t *testing.T) {
+	serverCertPEM, _, err := testutil.GenerateCert("relay.internal", false)
 	if err != nil {
 		t.Fatalf("create server cert: %v", err)
 	}
 
-	_, err = NewRemoteSigner(RemoteSignerConfig{
+	rs, err := NewRemoteSigner(RemoteSignerConfig{
 		Endpoint:   "relay.internal:9443",
 		ServerName: "relay.internal",
 		KeyID:      "relay-cert",
-		// intentionally omit RootCAPEM
-		ClientCertPEM: clientCertPEM,
-		ClientKeyPEM:  clientKeyPEM,
 	}, serverCertPEM)
-	if err == nil {
-		t.Fatal("expected NewRemoteSigner to require root CA")
+	if err != nil {
+		t.Fatalf("NewRemoteSigner() error = %v", err)
 	}
-
-	_, err = NewRemoteSigner(RemoteSignerConfig{
-		Endpoint:     "relay.internal:9443",
-		ServerName:   "relay.internal",
-		KeyID:        "relay-cert",
-		RootCAPEM:    rootCAPEM,
-		ClientKeyPEM: clientKeyPEM,
-	}, serverCertPEM)
-	if err == nil {
-		t.Fatal("expected NewRemoteSigner to require client certificate")
-	}
-
-	_, err = NewRemoteSigner(RemoteSignerConfig{
-		Endpoint:      "relay.internal:9443",
-		ServerName:    "relay.internal",
-		KeyID:         "relay-cert",
-		RootCAPEM:     rootCAPEM,
-		ClientCertPEM: clientCertPEM,
-	}, serverCertPEM)
-	if err == nil {
-		t.Fatal("expected NewRemoteSigner to require client key")
-	}
+	defer rs.Close()
 }
 
 func TestSignEndpoint_DefaultsToHTTPS(t *testing.T) {
@@ -200,11 +202,11 @@ func TestSignEndpoint_RejectsQueryOrFragment(t *testing.T) {
 }
 
 func TestRemoteSignerSign_HTTPJSON(t *testing.T) {
-	serverCertPEM, serverKeyPEM, err := testCertAndKeyPEMWithCN("relay.internal", false)
+	serverCertPEM, serverKeyPEM, err := testutil.GenerateCert("relay.internal", false)
 	if err != nil {
 		t.Fatalf("create server cert: %v", err)
 	}
-	clientCertPEM, clientKeyPEM, err := testCertAndKeyPEM(false)
+	clientCertPEM, clientKeyPEM, err := testutil.GenerateCert("test.local", false)
 	if err != nil {
 		t.Fatalf("create client cert: %v", err)
 	}
@@ -276,11 +278,11 @@ func TestRemoteSignerSign_HTTPJSON(t *testing.T) {
 }
 
 func TestRemoteSignerSign_HTTPError(t *testing.T) {
-	serverCertPEM, serverKeyPEM, err := testCertAndKeyPEMWithCN("relay.internal", false)
+	serverCertPEM, serverKeyPEM, err := testutil.GenerateCert("relay.internal", false)
 	if err != nil {
 		t.Fatalf("create server cert: %v", err)
 	}
-	clientCertPEM, clientKeyPEM, err := testCertAndKeyPEM(false)
+	clientCertPEM, clientKeyPEM, err := testutil.GenerateCert("test.local", false)
 	if err != nil {
 		t.Fatalf("create client cert: %v", err)
 	}
@@ -323,45 +325,4 @@ func TestRemoteSignerSign_HTTPError(t *testing.T) {
 	if !strings.Contains(err.Error(), "bad request") {
 		t.Fatalf("unexpected error: %v", err)
 	}
-}
-
-func testCertAndKeyPEM(isCA bool) ([]byte, []byte, error) {
-	return testCertAndKeyPEMWithCN("test.local", isCA)
-}
-
-func testCertAndKeyPEMWithCN(commonName string, isCA bool) ([]byte, []byte, error) {
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	tpl := &x509.Certificate{
-		SerialNumber: big.NewInt(time.Now().UnixNano()),
-		Subject: pkix.Name{
-			CommonName: commonName,
-		},
-		NotBefore:             time.Now().Add(-time.Minute),
-		NotAfter:              time.Now().Add(time.Hour),
-		BasicConstraintsValid: true,
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		DNSNames:              []string{commonName},
-	}
-	if isCA {
-		tpl.IsCA = true
-		tpl.KeyUsage |= x509.KeyUsageCertSign
-	}
-
-	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, &priv.PublicKey, priv)
-	if err != nil {
-		return nil, nil, err
-	}
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-
-	keyDER, err := x509.MarshalPKCS8PrivateKey(priv)
-	if err != nil {
-		return nil, nil, err
-	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
-
-	return certPEM, keyPEM, nil
 }

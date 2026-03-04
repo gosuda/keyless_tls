@@ -53,7 +53,7 @@ func main() {
 				return dialFn(ctx, *defaultUpstream)
 			}
 
-			if addr, ok := routes[normalizeHost(info.ServerName)]; ok {
+			if addr, ok := routes[l4.NormalizeServerName(info.ServerName)]; ok {
 				return dialFn(ctx, addr)
 			}
 			if *defaultUpstream != "" {
@@ -87,7 +87,7 @@ func (f *routeFlag) Set(v string) error {
 	if !ok {
 		return errors.New("route must be host=upstream")
 	}
-	host = normalizeHost(host)
+	host = l4.NormalizeServerName(host)
 	addr = strings.TrimSpace(addr)
 	if host == "" || addr == "" {
 		return errors.New("route requires non-empty host and upstream")
@@ -97,8 +97,4 @@ func (f *routeFlag) Set(v string) error {
 	}
 	(*f)[host] = addr
 	return nil
-}
-
-func normalizeHost(host string) string {
-	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
 }

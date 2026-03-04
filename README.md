@@ -342,6 +342,30 @@ go run ./examples/tunnel-http \
 - Keep only the public certificate chain in tunnel apps
 - Enforce signer mTLS and pair it with `KeyID`-scoped ACLs
 
+### Signer API contract (`/v1/sign`)
+
+Request:
+
+```json
+{
+  "key_id": "relay-cert",
+  "algorithm": "RSA_PSS_SHA256",
+  "digest": "<base64>",
+  "timestamp_unix": 1735628400,
+  "nonce": "c4d76ad40f5d8f95a1fe4b2f1c922f4a"
+}
+```
+
+Response:
+
+```json
+{
+  "key_id": "relay-cert",
+  "algorithm": "RSA_PSS_SHA256",
+  "signature": "<base64>"
+}
+```
+
 ## Package structure
 
 - `keyless`: SDK for application developers (tunnel app integration point)
@@ -349,6 +373,7 @@ go run ./examples/tunnel-http \
 - `relay/signrpc`: signer JSON request/response types
 - `relay/signer`: signing service/key store
 - `relay/server`: signer HTTPS (mandatory mTLS) server launcher
+- `keyless/lifecycle`: per-lease mTLS identity management (issue, renew, validate, disk-backed encrypted store)
 - `relay/l4`: TCP passthrough relay + optional ClientHello (SNI/ALPN) inspection hook
 
 ## Current status

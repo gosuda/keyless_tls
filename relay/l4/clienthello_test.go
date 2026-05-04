@@ -70,6 +70,35 @@ func TestInspectClientHello_NonTLSRecord(t *testing.T) {
 	}
 }
 
+func TestInspectClientHello_ECHOffered(t *testing.T) {
+	record := captureClientHelloRecord(t, "public.example.com", []string{"h2"})
+	record = appendClientHelloExtension(t, record, extEncryptedClientHello, []byte{1})
+
+	client, server := net.Pipe()
+	defer client.Close()
+
+	go func() {
+		defer client.Close()
+		_, _ = client.Write(record)
+	}()
+
+	info, wrapped, err := InspectClientHello(server, time.Second)
+	if err != nil {
+		t.Fatalf("InspectClientHello() error = %v", err)
+	}
+	defer wrapped.Close()
+
+	if !info.ECHOffered {
+		t.Fatal("expected ECHOffered to be true")
+	}
+	if got, want := info.ServerName, "public.example.com"; got != want {
+		t.Fatalf("server name = %q, want %q", got, want)
+	}
+	if got := len(info.ALPNProtocols); got != 1 || info.ALPNProtocols[0] != "h2" {
+		t.Fatalf("ALPN protocols = %v, want [h2]", info.ALPNProtocols)
+	}
+}
+
 func TestProxy_DialByClientHelloReceivesParseError(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
@@ -197,4 +226,90 @@ func captureClientHelloRecord(t *testing.T, serverName string, alpn []string) []
 	}
 
 	return append(header, body...)
+}
+
+func appendClientHelloExtension(t *testing.T, record []byte, extType uint16, extData []byte) []byte {
+	t.Helper()
+
+	if len(record) < tlsRecordHeaderLen+4 {
+		t.Fatal("record too short")
+	}
+	if record[0] != tlsContentTypeHandshake {
+		t.Fatal("record is not a TLS handshake record")
+	}
+
+	recordLen := int(record[3])<<8 | int(record[4])
+	if tlsRecordHeaderLen+recordLen != len(record) {
+		t.Fatalf("record length = %d, want %d", recordLen, len(record)-tlsRecordHeaderLen)
+	}
+
+	body := record[tlsRecordHeaderLen:]
+	if body[0] != tlsHandshakeTypeClientHi {
+		t.Fatal("handshake is not ClientHello")
+	}
+	msgLen := int(body[1])<<16 | int(body[2])<<8 | int(body[3])
+	if 4+msgLen != len(body) {
+		t.Fatalf("handshake length = %d, want %d", msgLen, len(body)-4)
+	}
+
+	msg := body[4:]
+	i := 34
+	if i >= len(msg) {
+		t.Fatal("ClientHello missing session ID")
+	}
+	sessLen := int(msg[i])
+	i++
+	if i+sessLen > len(msg) {
+		t.Fatal("ClientHello session ID truncated")
+	}
+	i += sessLen
+
+	if i+2 > len(msg) {
+		t.Fatal("ClientHello missing cipher suites")
+	}
+	cipherLen := int(msg[i])<<8 | int(msg[i+1])
+	i += 2 + cipherLen
+	if i >= len(msg) {
+		t.Fatal("ClientHello missing compression methods")
+	}
+	compLen := int(msg[i])
+	i++
+	if i+compLen > len(msg) {
+		t.Fatal("ClientHello compression methods truncated")
+	}
+	i += compLen
+
+	if i+2 > len(msg) {
+		t.Fatal("ClientHello missing extensions")
+	}
+	extLenOffset := tlsRecordHeaderLen + 4 + i
+	extLen := int(record[extLenOffset])<<8 | int(record[extLenOffset+1])
+	extEnd := extLenOffset + 2 + extLen
+	if extEnd != len(record) {
+		t.Fatalf("extensions end offset = %d, want %d", extEnd, len(record))
+	}
+
+	encodedExt := make([]byte, 4+len(extData))
+	encodedExt[0] = byte(extType >> 8)
+	encodedExt[1] = byte(extType)
+	encodedExt[2] = byte(len(extData) >> 8)
+	encodedExt[3] = byte(len(extData))
+	copy(encodedExt[4:], extData)
+
+	out := append([]byte(nil), record...)
+	out = append(out[:extEnd], append(encodedExt, out[extEnd:]...)...)
+
+	extLen += len(encodedExt)
+	msgLen += len(encodedExt)
+	recordLen += len(encodedExt)
+
+	out[3] = byte(recordLen >> 8)
+	out[4] = byte(recordLen)
+	out[6] = byte(msgLen >> 16)
+	out[7] = byte(msgLen >> 8)
+	out[8] = byte(msgLen)
+	out[extLenOffset] = byte(extLen >> 8)
+	out[extLenOffset+1] = byte(extLen)
+
+	return out
 }

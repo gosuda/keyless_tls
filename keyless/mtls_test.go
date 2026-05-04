@@ -2,6 +2,7 @@ package keyless
 
 import (
 	"crypto/tls"
+	"errors"
 	"testing"
 
 	"github.com/gosuda/keyless_tls/internal/testutil"
@@ -79,5 +80,61 @@ func TestNewClientTLSConfig_EmptyServerName(t *testing.T) {
 	}
 	if tlsConf.ServerName != "" {
 		t.Fatalf("expected empty ServerName, got %q", tlsConf.ServerName)
+	}
+}
+
+func TestNewClientTLSConfigWithOptions_ECH(t *testing.T) {
+	echConfigList := []byte{0x00, 0x02, 0xfe, 0x0d}
+	verify := func(tls.ConnectionState) error { return nil }
+
+	tlsConf, err := NewClientTLSConfigWithOptions(ClientTLSConfigOptions{
+		ServerName:                          "inner.example.com",
+		EncryptedClientHelloConfigList:      echConfigList,
+		EncryptedClientHelloRejectionVerify: verify,
+	})
+	if err != nil {
+		t.Fatalf("NewClientTLSConfigWithOptions() error = %v", err)
+	}
+	if string(tlsConf.EncryptedClientHelloConfigList) != string(echConfigList) {
+		t.Fatalf("ECH config list = %x, want %x", tlsConf.EncryptedClientHelloConfigList, echConfigList)
+	}
+	if tlsConf.EncryptedClientHelloRejectionVerify == nil {
+		t.Fatal("expected ECH rejection verifier to be set")
+	}
+}
+
+func TestShouldFallbackFromECH(t *testing.T) {
+	tlsConf := &tls.Config{EncryptedClientHelloConfigList: []byte{0xfe, 0x0d}}
+
+	if !shouldFallbackFromECH(&tls.ECHRejectionError{}, tlsConf, true) {
+		t.Fatal("expected fallback for ECH rejection when explicitly allowed")
+	}
+	if shouldFallbackFromECH(&tls.ECHRejectionError{}, tlsConf, false) {
+		t.Fatal("fallback should require explicit opt-in")
+	}
+	if shouldFallbackFromECH(errors.New("handshake failed"), tlsConf, true) {
+		t.Fatal("fallback should only apply to ECH rejection errors")
+	}
+}
+
+func TestCloneWithoutECH(t *testing.T) {
+	tlsConf := &tls.Config{
+		ServerName:                          "inner.example.com",
+		EncryptedClientHelloConfigList:      []byte{0xfe, 0x0d},
+		EncryptedClientHelloRejectionVerify: func(tls.ConnectionState) error { return nil },
+	}
+
+	clone := cloneWithoutECH(tlsConf)
+	if clone == tlsConf {
+		t.Fatal("expected TLS config clone")
+	}
+	if len(clone.EncryptedClientHelloConfigList) != 0 {
+		t.Fatal("expected fallback config to clear ECH config list")
+	}
+	if clone.EncryptedClientHelloRejectionVerify != nil {
+		t.Fatal("expected fallback config to clear ECH rejection verifier")
+	}
+	if clone.ServerName != tlsConf.ServerName {
+		t.Fatalf("ServerName = %q, want %q", clone.ServerName, tlsConf.ServerName)
 	}
 }

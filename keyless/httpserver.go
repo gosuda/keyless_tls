@@ -15,6 +15,9 @@ type HTTPServerAttachConfig struct {
 	MinTLSVersion    uint16
 	PreserveExisting bool
 
+	// EncryptedClientHelloKeys enables ECH on the attached public TLS server.
+	EncryptedClientHelloKeys []tls.EncryptedClientHelloKey
+
 	// ClientCAPEM is PEM-encoded CA certificate(s) for verifying client certs.
 	// When set, the server will request (or require) client certificates
 	// depending on RequireClientCert.
@@ -55,12 +58,13 @@ func AttachToHTTPServer(server *http.Server, cfg HTTPServerAttachConfig) (*Remot
 	}
 
 	tlsConf, err := NewServerTLSConfig(ServerTLSConfig{
-		CertPEM:    cfg.CertPEM,
-		Signer:     remoteSigner,
-		NextProtos: cfg.NextProtos,
-		MinVersion: cfg.MinTLSVersion,
-		ClientCAs:  clientCAs,
-		ClientAuth: clientAuth,
+		CertPEM:                  cfg.CertPEM,
+		Signer:                   remoteSigner,
+		NextProtos:               cfg.NextProtos,
+		MinVersion:               cfg.MinTLSVersion,
+		EncryptedClientHelloKeys: cfg.EncryptedClientHelloKeys,
+		ClientCAs:                clientCAs,
+		ClientAuth:               clientAuth,
 	})
 	if err != nil {
 		_ = remoteSigner.Close()
@@ -78,6 +82,12 @@ func AttachToHTTPServer(server *http.Server, cfg HTTPServerAttachConfig) (*Remot
 		if tlsConf.ClientCAs != nil {
 			server.TLSConfig.ClientCAs = tlsConf.ClientCAs
 			server.TLSConfig.ClientAuth = tlsConf.ClientAuth
+		}
+		if len(tlsConf.EncryptedClientHelloKeys) > 0 {
+			server.TLSConfig.EncryptedClientHelloKeys = tlsConf.EncryptedClientHelloKeys
+			// A preserved raw tls.Config may already have Go's dynamic ECH
+			// callback set; clear it so these static keys are honored.
+			server.TLSConfig.GetEncryptedClientHelloKeys = nil
 		}
 	} else {
 		server.TLSConfig = tlsConf

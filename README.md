@@ -102,6 +102,7 @@ tlsConf, err := keyless.NewServerTLSConfig(keyless.ServerTLSConfig{
     CertPEM:    certPEM,
     Signer:     rSigner,
     NextProtos: []string{"h2", "http/1.1"},
+    // EncryptedClientHelloKeys: []tls.EncryptedClientHelloKey{echKey},
     // MinVersion: tls.VersionTLS13,
 })
 if err != nil {
@@ -109,28 +110,82 @@ if err != nil {
 }
 ```
 
+### Encrypted ClientHello (ECH)
+
+`keyless.NewServerTLSConfig` and `keyless.AttachToHTTPServer` can pass ECH
+keys through to Go's TLS stack:
+
+```go
+tlsConf, err := keyless.NewServerTLSConfig(keyless.ServerTLSConfig{
+    CertPEM: certPEM,
+    Signer:  rSigner,
+    EncryptedClientHelloKeys: []tls.EncryptedClientHelloKey{
+        {
+            Config:      echConfig,
+            PrivateKey:  echPrivateKey,
+            SendAsRetry: true,
+        },
+    },
+})
+```
+
+The tunnel app must have the ECH private key because it owns the TLS handshake
+and decrypts ClientHello. The remote signer still only signs
+`CertificateVerify`; it does not receive ECH secrets or traffic keys.
+
+ECH config generation and publication are intentionally external to this SDK.
+Distribute the matching ECHConfigList to clients through your chosen control
+plane, typically DNS HTTPS/SVCB records.
+
+Client-side ECH fallback is intentionally opt-in because it trades SNI privacy
+for availability. Use `DialClientTLS` with `AllowECHFallback` to retry once
+without ECH only when Go reports `tls.ECHRejectionError`:
+
+```go
+tlsConf, err := keyless.NewClientTLSConfigWithOptions(keyless.ClientTLSConfigOptions{
+    ServerName:                     "app.example.com",
+    RootCAPEM:                      rootCAPEM,
+    EncryptedClientHelloConfigList: echConfigList,
+})
+if err != nil {
+    // handle error
+}
+
+conn, err := keyless.DialClientTLS(ctx, "tcp", "app.example.com:443", keyless.ClientDialConfig{
+    TLSConfig:        tlsConf,
+    AllowECHFallback: true,
+})
+```
+
 ### SDK: SNI metadata for relay routing (caller-controlled)
 
 If you are implementing your own relay/proxy with this library, use the `relay/l4`
 APIs to inspect ClientHello and route by SNI/ALPN while keeping all policy in caller code.
 
-- `l4.InspectClientHello(conn, timeout)`: parse `ServerName`/`ALPNProtocols` and return a wrapped `net.Conn`
+- `l4.InspectClientHello(conn, timeout)`: parse `ServerName`/`ALPNProtocols`/`ECHOffered` and return a wrapped `net.Conn`
 - `l4.Proxy.DialByClientHello(ctx, info, parseErr)`: caller decides route/fallback/reject policy
 
 How this works in practice:
 
 1) incoming TCP connection arrives
-2) library reads only ClientHello metadata (no TLS termination)
-3) your callback receives `info.ServerName`, `info.ALPNProtocols`, and `parseErr`
+2) library reads only visible ClientHello metadata (no TLS termination)
+3) your callback receives `info.ServerName`, `info.ALPNProtocols`, `info.ECHOffered`, and `parseErr`
 4) your code selects upstream target (or rejects)
-5) relay continues raw TCP forwarding with no payload loss
+5) relay continues raw TCP forwarding; TLS payload stays opaque to the relay
 
 Typical SDK routing policies:
 
 - Multi-tenant host routing: `app1.example.com -> tenant A`, `app2.example.com -> tenant B`
 - Protocol-aware routing: `h2` preferred upstream vs `http/1.1` upstream
+- Default fallback for unmatched visible SNI, including ECH outer SNI misses
 - Strict security mode: reject when ClientHello parse fails
 - Compatibility mode: fallback to default upstream when parse fails
+
+Relay ECH policy is intentionally simple: the relay sees only the visible outer
+SNI and whether ECH was offered. It does not see the encrypted inner SNI or TLS
+payload. When `info.ECHOffered` is true, `info.ServerName` is the outer public
+name. Route by that outer name, use the default upstream for unmatched outer SNI
+when configured, or reject.
 
 Concrete policy example (easy to adapt):
 
@@ -258,7 +313,7 @@ including whether ClientHello parse failures may use the default upstream.
 Useful `cmd/relay-l4` route-mode flags:
 
 - `-route host=upstream` (repeatable): explicit SNI mapping
-- `-default-upstream`: fallback target for unknown SNI
+- `-default-upstream`: fallback target for unknown visible SNI, including ECH outer SNI misses
 - `-allow-parse-error`: allow non-TLS/invalid ClientHello to use fallback
 - `-clienthello-timeout`: maximum ClientHello inspection time
 
@@ -297,7 +352,8 @@ Generated static routes:
 Policy remains caller-owned:
 
 - known SNI: route to mapped upstream
-- unknown SNI: route to `-default-upstream` when configured
+- unknown visible SNI: route to `-default-upstream` when configured
+- ECH with no matching outer SNI route: route to `-default-upstream` when configured
 - non-TLS or invalid ClientHello: route to `-default-upstream` when configured, otherwise reject
 
 Important flags for `examples/relay-10-targets`:
@@ -306,7 +362,7 @@ Important flags for `examples/relay-10-targets`:
 - `-upstream-host`: host used for generated targets
 - `-base-port`: first target port (`app1`)
 - `-domain`: host suffix used for SNI matching
-- `-default-upstream`: optional fallback upstream
+- `-default-upstream`: optional fallback upstream for unknown visible SNI and ECH outer SNI misses
 - `-dial-timeout`: upstream dial timeout
 - `-clienthello-timeout`: ClientHello inspection timeout
 

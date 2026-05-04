@@ -16,6 +16,7 @@ const (
 	tlsContentTypeHandshake  = 22
 	extServerName            = 0
 	extALPN                  = 16
+	extEncryptedClientHello  = 0xfe0d
 	defaultInspectTimeout    = 2 * time.Second
 )
 
@@ -27,8 +28,12 @@ var (
 type ClientHelloInfo struct {
 	ServerName    string
 	ALPNProtocols []string
-	ClientAddr    net.Addr
-	LocalAddr     net.Addr
+	// ECHOffered is true when the visible ClientHello contains the
+	// encrypted_client_hello extension. In that case ServerName is the outer
+	// public name, not the encrypted inner SNI.
+	ECHOffered bool
+	ClientAddr net.Addr
+	LocalAddr  net.Addr
 }
 
 func InspectClientHello(conn net.Conn, timeout time.Duration) (ClientHelloInfo, net.Conn, error) {
@@ -152,6 +157,8 @@ func parseClientHelloRecord(recordBody []byte) (ClientHelloInfo, error) {
 			}
 		case extALPN:
 			info.ALPNProtocols = parseALPNExtension(extData)
+		case extEncryptedClientHello:
+			info.ECHOffered = true
 		}
 	}
 

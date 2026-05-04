@@ -7,6 +7,19 @@ import (
 	"fmt"
 )
 
+type ClientTLSConfigOptions struct {
+	ClientCertPEM []byte
+	ClientKeyPEM  []byte
+	RootCAPEM     []byte
+	ServerName    string
+
+	// EncryptedClientHelloConfigList enables client-side ECH when populated.
+	EncryptedClientHelloConfigList []byte
+	// EncryptedClientHelloRejectionVerify optionally verifies the provider
+	// certificate when ECH is rejected.
+	EncryptedClientHelloRejectionVerify func(tls.ConnectionState) error
+}
+
 // NewClientTLSConfig builds a client-side *tls.Config with optional mTLS.
 //
 // All parameters are optional:
@@ -14,27 +27,38 @@ import (
 //   - rootCAPEM: if provided, pins the server CA. Otherwise uses the system cert pool.
 //   - serverName: if non-empty, sets the TLS ServerName for SNI.
 func NewClientTLSConfig(clientCertPEM, clientKeyPEM, rootCAPEM []byte, serverName string) (*tls.Config, error) {
-	hasCert := len(clientCertPEM) > 0
-	hasKey := len(clientKeyPEM) > 0
+	return NewClientTLSConfigWithOptions(ClientTLSConfigOptions{
+		ClientCertPEM: clientCertPEM,
+		ClientKeyPEM:  clientKeyPEM,
+		RootCAPEM:     rootCAPEM,
+		ServerName:    serverName,
+	})
+}
+
+func NewClientTLSConfigWithOptions(cfg ClientTLSConfigOptions) (*tls.Config, error) {
+	hasCert := len(cfg.ClientCertPEM) > 0
+	hasKey := len(cfg.ClientKeyPEM) > 0
 	if hasCert != hasKey {
 		return nil, errors.New("client certificate and key must both be provided or both be empty")
 	}
 
 	tlsConf := &tls.Config{
-		MinVersion: tls.VersionTLS13,
-		ServerName: serverName,
+		MinVersion:                          tls.VersionTLS13,
+		ServerName:                          cfg.ServerName,
+		EncryptedClientHelloConfigList:      cfg.EncryptedClientHelloConfigList,
+		EncryptedClientHelloRejectionVerify: cfg.EncryptedClientHelloRejectionVerify,
 	}
 
-	if len(rootCAPEM) > 0 {
+	if len(cfg.RootCAPEM) > 0 {
 		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(rootCAPEM) {
+		if !pool.AppendCertsFromPEM(cfg.RootCAPEM) {
 			return nil, errors.New("failed to parse root CA PEM")
 		}
 		tlsConf.RootCAs = pool
 	}
 
 	if hasCert {
-		cert, err := tls.X509KeyPair(clientCertPEM, clientKeyPEM)
+		cert, err := tls.X509KeyPair(cfg.ClientCertPEM, cfg.ClientKeyPEM)
 		if err != nil {
 			return nil, fmt.Errorf("parse client key pair: %w", err)
 		}

@@ -21,7 +21,7 @@ func main() {
 		upstreamHost       = flag.String("upstream-host", "127.0.0.1", "target upstream host")
 		basePort           = flag.Int("base-port", 9001, "base port for app1..app10")
 		domain             = flag.String("domain", "demo.local", "domain suffix for hostnames")
-		defaultUpstream    = flag.String("default-upstream", "", "fallback upstream for unknown/non-TLS clients")
+		defaultUpstream    = flag.String("default-upstream", "", "fallback upstream for unknown visible SNI, ECH outer SNI misses, and non-TLS clients")
 		dialTimeout        = flag.Duration("dial-timeout", 3*time.Second, "upstream dial timeout")
 		clientHelloTimeout = flag.Duration("clienthello-timeout", 2*time.Second, "TLS ClientHello inspect timeout")
 	)
@@ -73,7 +73,7 @@ func selectUpstream(routes map[string]string, defaultUpstream string, info l4.Cl
 	if defaultUpstream != "" {
 		return defaultUpstream, nil
 	}
-	return "", fmt.Errorf("no route for server name %q", info.ServerName)
+	return "", fmt.Errorf("no route for server name %q (ech_offered=%t)", info.ServerName, info.ECHOffered)
 }
 
 func newDialByClientHello(routes map[string]string, defaultUpstream string, dialTimeout time.Duration) func(context.Context, l4.ClientHelloInfo, error) (net.Conn, error) {

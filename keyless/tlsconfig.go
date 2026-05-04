@@ -15,6 +15,10 @@ type ServerTLSConfig struct {
 	NextProtos []string
 	MinVersion uint16
 
+	// EncryptedClientHelloKeys enables server-side ECH when populated.
+	// The key Config bytes must match the ECHConfig distributed to clients.
+	EncryptedClientHelloKeys []tls.EncryptedClientHelloKey
+
 	// ClientCAs is an optional CA pool for verifying client certificates.
 	// When non-nil, ClientAuth must also be set to a value that requests
 	// or requires client certs; otherwise the pool is ignored by crypto/tls.
@@ -42,13 +46,17 @@ func NewServerTLSConfig(cfg ServerTLSConfig) (*tls.Config, error) {
 	if minVersion == 0 {
 		minVersion = tls.VersionTLS13
 	}
+	if len(cfg.EncryptedClientHelloKeys) > 0 && minVersion < tls.VersionTLS13 {
+		return nil, errors.New("encrypted ClientHello requires TLS 1.3")
+	}
 
 	tlsConf := &tls.Config{
-		MinVersion:   minVersion,
-		Certificates: []tls.Certificate{cert},
-		NextProtos:   cfg.NextProtos,
-		ClientCAs:    cfg.ClientCAs,
-		ClientAuth:   cfg.ClientAuth,
+		MinVersion:               minVersion,
+		Certificates:             []tls.Certificate{cert},
+		NextProtos:               cfg.NextProtos,
+		ClientCAs:                cfg.ClientCAs,
+		ClientAuth:               cfg.ClientAuth,
+		EncryptedClientHelloKeys: cfg.EncryptedClientHelloKeys,
 	}
 
 	if len(tlsConf.NextProtos) == 0 {

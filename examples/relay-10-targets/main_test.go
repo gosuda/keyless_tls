@@ -57,6 +57,23 @@ func TestSelectUpstream(t *testing.T) {
 		}
 	})
 
+	t.Run("ech without route uses default", func(t *testing.T) {
+		upstream, err := selectUpstream(routes, "127.0.0.1:9999", l4.ClientHelloInfo{ServerName: "public.example.com", ECHOffered: true}, nil)
+		if err != nil {
+			t.Fatalf("selectUpstream() error = %v", err)
+		}
+		if upstream != "127.0.0.1:9999" {
+			t.Fatalf("upstream = %q, want %q", upstream, "127.0.0.1:9999")
+		}
+	})
+
+	t.Run("ech without route and no default rejects", func(t *testing.T) {
+		_, err := selectUpstream(routes, "", l4.ClientHelloInfo{ServerName: "public.example.com", ECHOffered: true}, nil)
+		if err == nil {
+			t.Fatal("expected error for ECH route miss without default")
+		}
+	})
+
 	t.Run("unknown without default", func(t *testing.T) {
 		_, err := selectUpstream(routes, "", l4.ClientHelloInfo{ServerName: "unknown.demo.local"}, nil)
 		if err == nil {

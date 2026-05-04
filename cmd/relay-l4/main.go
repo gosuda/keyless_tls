@@ -18,7 +18,7 @@ import (
 func main() {
 	var (
 		listenAddr         = flag.String("listen", ":443", "public relay listen address")
-		defaultUpstream    = flag.String("default-upstream", "", "fallback upstream when SNI route is missing")
+		defaultUpstream    = flag.String("default-upstream", "", "fallback upstream when visible SNI route is missing, including ECH outer SNI")
 		dialTimeout        = flag.Duration("dial-timeout", 3*time.Second, "upstream dial timeout")
 		clientHelloTimeout = flag.Duration("clienthello-timeout", 2*time.Second, "TLS ClientHello inspect timeout")
 		allowParseError    = flag.Bool("allow-parse-error", true, "if true, allow non-TLS/invalid ClientHello to use default route")
@@ -59,7 +59,7 @@ func main() {
 			if *defaultUpstream != "" {
 				return dialFn(ctx, *defaultUpstream)
 			}
-			return nil, fmt.Errorf("no route for server name %q", info.ServerName)
+			return nil, fmt.Errorf("no route for server name %q (ech_offered=%t)", info.ServerName, info.ECHOffered)
 		},
 	}
 

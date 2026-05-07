@@ -6,10 +6,12 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -274,6 +276,73 @@ func TestRemoteSignerSign_HTTPJSON(t *testing.T) {
 	}
 	if string(sig) != "signed" {
 		t.Fatalf("unexpected signature: %q", string(sig))
+	}
+}
+
+func TestRemoteSignerSign_DynamicHeaders(t *testing.T) {
+	serverCertPEM, serverKeyPEM, err := testutil.GenerateCert("relay.internal", false)
+	if err != nil {
+		t.Fatalf("create server cert: %v", err)
+	}
+
+	var headerCalls atomic.Int32
+	var requests atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc(signrpc.SignPath, func(w http.ResponseWriter, r *http.Request) {
+		expected := fmt.Sprintf("token-%d", requests.Add(1))
+		if got := r.Header.Get("X-Portal-Access-Token"); got != expected {
+			t.Fatalf("unexpected access token: %q, want %q", got, expected)
+		}
+
+		var req signrpc.SignRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(signrpc.SignResponse{
+			KeyID:     req.KeyID,
+			Algorithm: req.Algorithm,
+			Signature: []byte("signed"),
+		})
+	})
+
+	ts := httptest.NewUnstartedServer(mux)
+	cert, err := tls.X509KeyPair(serverCertPEM, serverKeyPEM)
+	if err != nil {
+		t.Fatalf("load server keypair: %v", err)
+	}
+	ts.TLS = &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{cert}}
+	ts.StartTLS()
+	defer ts.Close()
+
+	relayCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]})
+	rSigner, err := NewRemoteSigner(RemoteSignerConfig{
+		Endpoint:   strings.TrimPrefix(ts.URL, "https://"),
+		ServerName: "relay.internal",
+		KeyID:      "relay-cert",
+		RootCAPEM:  relayCertPEM,
+		Timeout:    2 * time.Second,
+		Headers: func() http.Header {
+			token := fmt.Sprintf("token-%d", headerCalls.Add(1))
+			return http.Header{"X-Portal-Access-Token": []string{token}}
+		},
+	}, relayCertPEM)
+	if err != nil {
+		t.Fatalf("NewRemoteSigner() error = %v", err)
+	}
+	defer rSigner.Close()
+
+	for i := 0; i < 2; i++ {
+		if _, err := rSigner.Sign(rand.Reader, []byte{1, 2, 3}, crypto.SHA256); err != nil {
+			t.Fatalf("Sign() error = %v", err)
+		}
+	}
+	if got := headerCalls.Load(); got != 2 {
+		t.Fatalf("header callback calls = %d, want 2", got)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("requests = %d, want 2", got)
 	}
 }
 

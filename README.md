@@ -110,6 +110,18 @@ if err != nil {
 }
 ```
 
+If the signer endpoint is protected by a rotating access token, attach it with
+`RemoteSignerConfig.Headers`. The callback runs for every `/v1/sign` request and
+must be safe for concurrent use:
+
+```go
+remoteSignerCfg.Headers = func() http.Header {
+    h := make(http.Header)
+    h.Set("X-Portal-Access-Token", currentAccessToken())
+    return h
+}
+```
+
 ### Encrypted ClientHello (ECH)
 
 `keyless.NewServerTLSConfig` and `keyless.AttachToHTTPServer` can pass ECH

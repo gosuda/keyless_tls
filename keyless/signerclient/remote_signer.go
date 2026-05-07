@@ -29,6 +29,7 @@ type RemoteSigner struct {
 	endpoint  string
 	client    *http.Client
 	timeout   time.Duration
+	headers   func() http.Header
 }
 
 func NewRemoteSigner(cfg RemoteSignerConfig, certPEM []byte) (*RemoteSigner, error) {
@@ -79,6 +80,7 @@ func NewRemoteSigner(cfg RemoteSignerConfig, certPEM []byte) (*RemoteSigner, err
 		endpoint:  endpoint,
 		client:    client,
 		timeout:   cfg.Timeout,
+		headers:   cfg.Headers,
 	}, nil
 }
 
@@ -159,6 +161,14 @@ func (s *RemoteSigner) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) 
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	if s.headers != nil {
+		for key, values := range s.headers() {
+			req.Header.Del(key)
+			for _, value := range values {
+				req.Header.Add(key, value)
+			}
+		}
+	}
 
 	httpResp, err := s.client.Do(req)
 	if err != nil {

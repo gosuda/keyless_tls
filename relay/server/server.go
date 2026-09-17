@@ -97,6 +97,46 @@ func signHandler(service *signer.Service) http.Handler {
 		}
 	})
 
+	mux.HandleFunc(signrpc.TranscriptSignPath, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+
+		if ct := r.Header.Get("Content-Type"); ct != "" && !strings.HasPrefix(ct, "application/json") {
+			writeJSONError(w, http.StatusUnsupportedMediaType, "content type must be application/json")
+			return
+		}
+
+		r.Body = http.MaxBytesReader(w, r.Body, 128<<10) // 128 KiB for full cert chains and handshake fragments
+		defer r.Body.Close()
+		var req signrpc.TranscriptSignRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid json body")
+			return
+		}
+
+		resp, err := service.SignTranscript(r.Context(), &req)
+		if err != nil {
+			status := http.StatusInternalServerError
+			switch {
+			case errors.Is(err, signer.ErrInvalidArgument):
+				status = http.StatusBadRequest
+			case errors.Is(err, signer.ErrPermissionDenied):
+				status = http.StatusForbidden
+			}
+			writeJSONError(w, status, err.Error())
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "failed to encode response")
+			return
+		}
+	})
+
 	return mux
 }
 

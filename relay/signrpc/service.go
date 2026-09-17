@@ -1,6 +1,9 @@
 package signrpc
 
-const SignPath = "/v1/sign"
+const (
+	SignPath           = "/v1/sign"
+	TranscriptSignPath = "/v1/sign-transcript"
+)
 
 const (
 	AlgorithmECDSASHA256       = "ECDSA_SHA256"
@@ -12,6 +15,7 @@ const (
 	AlgorithmRSAPSSSHA256      = "RSA_PSS_SHA256"
 	AlgorithmRSAPSSSHA384      = "RSA_PSS_SHA384"
 	AlgorithmRSAPSSSHA512      = "RSA_PSS_SHA512"
+	AlgorithmEd25519           = "Ed25519"
 )
 
 type SignRequest struct {
@@ -28,6 +32,25 @@ type SignResponse struct {
 	Signature []byte `json:"signature"`
 }
 
+type TranscriptSignRequest struct {
+	KeyID               string `json:"key_id"`
+	Algorithm           string `json:"algorithm"`
+	Binding             []byte `json:"binding"`
+	ClientHello         []byte `json:"client_hello"`
+	ServerHello         []byte `json:"server_hello"`
+	EncryptedExtensions []byte `json:"encrypted_extensions"`
+	Certificate         []byte `json:"certificate"`
+	TimestampUnix       int64  `json:"timestamp_unix"`
+	Nonce               string `json:"nonce"`
+}
+
+type TranscriptSignResponse struct {
+	KeyID     string `json:"key_id"`
+	Algorithm string `json:"algorithm"`
+	Signature []byte `json:"signature"`
+}
+
 type ErrorResponse struct {
 	Error string `json:"error"`
 }
+

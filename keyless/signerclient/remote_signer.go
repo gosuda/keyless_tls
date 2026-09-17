@@ -24,12 +24,13 @@ import (
 )
 
 type RemoteSigner struct {
-	keyID     string
-	publicKey crypto.PublicKey
-	endpoint  string
-	client    *http.Client
-	timeout   time.Duration
-	headers   func() http.Header
+	keyID              string
+	publicKey          crypto.PublicKey
+	endpoint           string
+	transcriptEndpoint string
+	client             *http.Client
+	timeout            time.Duration
+	headers            func() http.Header
 }
 
 func NewRemoteSigner(cfg RemoteSignerConfig, certPEM []byte) (*RemoteSigner, error) {
@@ -66,6 +67,7 @@ func NewRemoteSigner(cfg RemoteSignerConfig, certPEM []byte) (*RemoteSigner, err
 	if err != nil {
 		return nil, err
 	}
+	transcriptEndpoint := strings.TrimSuffix(endpoint, signrpc.SignPath) + signrpc.TranscriptSignPath
 	transport := &http.Transport{
 		TLSClientConfig:     tlsConf,
 		MaxIdleConns:        100,
@@ -75,12 +77,13 @@ func NewRemoteSigner(cfg RemoteSignerConfig, certPEM []byte) (*RemoteSigner, err
 	client := &http.Client{Transport: transport}
 
 	return &RemoteSigner{
-		keyID:     cfg.KeyID,
-		publicKey: pub,
-		endpoint:  endpoint,
-		client:    client,
-		timeout:   cfg.Timeout,
-		headers:   cfg.Headers,
+		keyID:              cfg.KeyID,
+		publicKey:          pub,
+		endpoint:           endpoint,
+		transcriptEndpoint: transcriptEndpoint,
+		client:             client,
+		timeout:            cfg.Timeout,
+		headers:            cfg.Headers,
 	}, nil
 }
 
@@ -117,6 +120,10 @@ func signerTLSConfig(cfg RemoteSignerConfig) (*tls.Config, error) {
 	}
 
 	return tlsConf, nil
+}
+
+func (s *RemoteSigner) KeyID() string {
+	return s.keyID
 }
 
 func (s *RemoteSigner) Public() crypto.PublicKey {
@@ -190,6 +197,81 @@ func (s *RemoteSigner) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) 
 	}
 
 	return resp.Signature, nil
+}
+
+func (s *RemoteSigner) SignTranscript(ctx context.Context, req *signrpc.TranscriptSignRequest) (*signrpc.TranscriptSignResponse, error) {
+	if req == nil {
+		return nil, errors.New("request is nil")
+	}
+	if req.KeyID == "" {
+		req.KeyID = s.keyID
+	}
+	if req.Nonce == "" {
+		nonce, err := randomHex(16)
+		if err != nil {
+			return nil, err
+		}
+		req.Nonce = nonce
+	}
+	if req.TimestampUnix == 0 {
+		req.TimestampUnix = time.Now().Unix()
+	}
+
+	reqCtx := ctx
+	var cancel context.CancelFunc
+	if reqCtx == nil {
+		reqCtx = context.Background()
+	}
+	if s.timeout > 0 {
+		reqCtx, cancel = context.WithTimeout(reqCtx, s.timeout)
+		defer cancel()
+	}
+
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("encode transcript sign request: %w", err)
+	}
+
+	url := s.transcriptEndpoint
+	if url == "" {
+		url = strings.TrimSuffix(s.endpoint, signrpc.SignPath) + signrpc.TranscriptSignPath
+	}
+
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("build transcript sign request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json")
+	if s.headers != nil {
+		for key, values := range s.headers() {
+			httpReq.Header.Del(key)
+			for _, value := range values {
+				httpReq.Header.Add(key, value)
+			}
+		}
+	}
+
+	httpResp, err := s.client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("remote transcript sign request failed: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode != http.StatusOK {
+		var errResp signrpc.ErrorResponse
+		if decodeErr := json.NewDecoder(httpResp.Body).Decode(&errResp); decodeErr == nil && errResp.Error != "" {
+			return nil, fmt.Errorf("remote transcript sign request failed: %s", errResp.Error)
+		}
+		return nil, fmt.Errorf("remote transcript sign request failed: http %d", httpResp.StatusCode)
+	}
+
+	var resp signrpc.TranscriptSignResponse
+	if err := json.NewDecoder(httpResp.Body).Decode(&resp); err != nil {
+		return nil, fmt.Errorf("decode transcript sign response: %w", err)
+	}
+
+	return &resp, nil
 }
 
 func (s *RemoteSigner) Close() error {

@@ -165,7 +165,8 @@ func TestTLS13Server_HTTPSInterop(t *testing.T) {
 	}
 
 	signerSvc := &signer.Service{
-		Store: &mockCryptoSignerStore{priv: priv},
+		Store:                         &mockCryptoSignerStore{priv: priv},
+		AllowUnboundTranscriptSigning: true,
 	}
 
 	srv, err := t13server.NewServer(t13server.Config{
@@ -330,7 +331,8 @@ func TestTLS13Server_NegativeTLS12Client(t *testing.T) {
 	}
 
 	signerSvc := &signer.Service{
-		Store: &mockCryptoSignerStore{priv: priv},
+		Store:                         &mockCryptoSignerStore{priv: priv},
+		AllowUnboundTranscriptSigning: true,
 	}
 
 	srv, err := t13server.NewServer(t13server.Config{
@@ -375,6 +377,58 @@ func TestTLS13Server_NegativeTLS12Client(t *testing.T) {
 	}
 }
 
+func TestTLS13Server_NegativeMissing0x1301InClientHello(t *testing.T) {
+	certPEM, keyPEM, err := testutil.GenerateCert("example.com", false)
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+
+	priv, err := parseECDSAPrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("parse key: %v", err)
+	}
+
+	signerSvc := &signer.Service{
+		Store:                         &mockCryptoSignerStore{priv: priv},
+		AllowUnboundTranscriptSigning: true,
+	}
+
+	srv, err := t13server.NewServer(t13server.Config{
+		CertPEM:          certPEM,
+		KeyID:            "test-key",
+		TranscriptSigner: signerSvc,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	serverPipe, clientPipe := net.Pipe()
+	defer serverPipe.Close()
+	defer clientPipe.Close()
+
+	go func() {
+		// Send a synthetic ClientHello offering only 0x1302 (TLS_AES_256_GCM_SHA384)
+		body := []byte{0x03, 0x03}                  // legacy version
+		body = append(body, make([]byte, 32)...)   // random
+		body = append(body, 0x00)                  // session id len 0
+		body = append(body, 0x00, 0x02, 0x13, 0x02) // cipher suites (only 0x1302)
+		body = append(body, 0x01, 0x00)            // compression
+		body = append(body, 0x00, 0x00)            // extensions len 0
+
+		msg := []byte{0x01, 0x00, byte(len(body) >> 8), byte(len(body))}
+		msg = append(msg, body...)
+
+		rec := []byte{0x16, 0x03, 0x03, byte(len(msg) >> 8), byte(len(msg))}
+		rec = append(rec, msg...)
+		_, _ = clientPipe.Write(rec)
+	}()
+
+	_, err = srv.ServeConn(context.Background(), serverPipe, nil)
+	if err == nil {
+		t.Fatal("expected ServeConn to fail when 0x1301 is missing, but got nil")
+	}
+}
+
 func TestTLS13Server_LargePayloadMultiRecord(t *testing.T) {
 	certPEM, keyPEM, err := testutil.GenerateCert("example.com", false)
 	if err != nil {
@@ -387,7 +441,8 @@ func TestTLS13Server_LargePayloadMultiRecord(t *testing.T) {
 	}
 
 	signerSvc := &signer.Service{
-		Store: &mockCryptoSignerStore{priv: priv},
+		Store:                         &mockCryptoSignerStore{priv: priv},
+		AllowUnboundTranscriptSigning: true,
 	}
 
 	srv, err := t13server.NewServer(t13server.Config{
@@ -639,3 +694,98 @@ func jsonEncode(w io.Writer, v any) error {
 func bytesReader(b []byte) io.Reader {
 	return bytes.NewReader(b)
 }
+
+func TestTLS13Server_AcceptDoesNotBlockOnStalledClient(t *testing.T) {
+	// Proves that a client connecting and stalling before sending ClientHello
+	// does not serialize or block the Accept() loop for other concurrent clients.
+	certPEM, keyPEM, err := testutil.GenerateCert("example.com", false)
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+
+	priv, err := parseECDSAPrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("parse key: %v", err)
+	}
+
+	signerSvc := &signer.Service{
+		Store:                         &mockCryptoSignerStore{priv: priv},
+		AllowUnboundTranscriptSigning: true,
+	}
+
+	srv, err := t13server.NewServer(t13server.Config{
+		CertPEM:          certPEM,
+		KeyID:            "test-key",
+		TranscriptSigner: signerSvc,
+		HandshakeTimeout: 500 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer rawLis.Close()
+
+	t13Lis := t13server.NewListener(rawLis, srv, nil)
+	defer t13Lis.Close()
+
+	// Server accept loop
+	acceptedConns := make(chan net.Conn, 10)
+	go func() {
+		for {
+			conn, err := t13Lis.Accept()
+			if err != nil {
+				return
+			}
+			acceptedConns <- conn
+			// Handle each accepted connection concurrently
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 64)
+				n, _ := c.Read(buf)
+				if n > 0 {
+					_, _ = c.Write([]byte("ok"))
+				}
+			}(conn)
+		}
+	}()
+
+	// 1. Client 1 connects via raw TCP and stalls (sends no bytes)
+	stalledClient, err := net.Dial("tcp", rawLis.Addr().String())
+	if err != nil {
+		t.Fatalf("client 1 dial: %v", err)
+	}
+	defer stalledClient.Close()
+
+	// 2. Client 2 connects via real TLS while Client 1 is stalled.
+	// In a synchronous accept loop, Client 2 would hang until Client 1 timed out.
+	// With lazy handshake, Client 2 connects and completes immediately!
+	rootPool := x509.NewCertPool()
+	rootPool.AppendCertsFromPEM(certPEM)
+
+	client2, err := tls.Dial("tcp", rawLis.Addr().String(), &tls.Config{
+		ServerName: "example.com",
+		RootCAs:    rootPool,
+		MinVersion: tls.VersionTLS13,
+	})
+	if err != nil {
+		t.Fatalf("client 2 tls.Dial failed while client 1 stalled: %v", err)
+	}
+	defer client2.Close()
+
+	if _, err := client2.Write([]byte("hello")); err != nil {
+		t.Fatalf("client 2 write: %v", err)
+	}
+	resp := make([]byte, 10)
+	n, err := client2.Read(resp)
+	if err != nil {
+		t.Fatalf("client 2 read: %v", err)
+	}
+	if string(resp[:n]) != "ok" {
+		t.Fatalf("unexpected response from client 2: %s", string(resp[:n]))
+	}
+}
+

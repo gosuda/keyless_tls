@@ -158,3 +158,40 @@ func TestSignTranscript_ValidationErrors(t *testing.T) {
 		t.Fatalf("expected ErrInvalidArgument for skewed timestamp, got %v", err)
 	}
 }
+
+func TestSignTranscript_FailClosedWithoutValidator(t *testing.T) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	store := &staticStore{keyID: "test-key", signer: priv}
+
+	// Without validator and without AllowUnboundTranscriptSigning: MUST FAIL
+	svc := &signer.Service{Store: store}
+	req := &signrpc.TranscriptSignRequest{
+		KeyID:               "test-key",
+		Algorithm:           signrpc.AlgorithmECDSASHA256,
+		Binding:             []byte("any-binding"),
+		ClientHello:         []byte("ch"),
+		ServerHello:         []byte("sh"),
+		EncryptedExtensions: []byte("ee"),
+		Certificate:         []byte("cert"),
+		TimestampUnix:       time.Now().Unix(),
+		Nonce:               "nonce",
+	}
+	_, err = svc.SignTranscript(context.Background(), req)
+	if !errors.Is(err, signer.ErrPermissionDenied) {
+		t.Fatalf("expected ErrPermissionDenied when validator is omitted, got %v", err)
+	}
+
+	// With AllowUnboundTranscriptSigning: true: SUCCESS
+	svc.AllowUnboundTranscriptSigning = true
+	resp, err := svc.SignTranscript(context.Background(), req)
+	if err != nil {
+		t.Fatalf("expected success with AllowUnboundTranscriptSigning, got %v", err)
+	}
+	if len(resp.Signature) == 0 {
+		t.Fatal("empty signature")
+	}
+}
+

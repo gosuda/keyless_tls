@@ -32,9 +32,10 @@ func (f TranscriptValidatorFunc) ValidateTranscript(ctx context.Context, req *si
 }
 
 type Service struct {
-	Store               KeyStore
-	AllowedSkew         time.Duration
-	TranscriptValidator TranscriptValidator
+	Store                        KeyStore
+	AllowedSkew                  time.Duration
+	TranscriptValidator          TranscriptValidator
+	AllowUnboundTranscriptSigning bool
 }
 
 func (s *Service) Sign(ctx context.Context, req *signrpc.SignRequest) (*signrpc.SignResponse, error) {
@@ -97,6 +98,8 @@ func (s *Service) SignTranscript(ctx context.Context, req *signrpc.TranscriptSig
 		if err := s.TranscriptValidator.ValidateTranscript(ctx, req); err != nil {
 			return nil, fmt.Errorf("%w: %s", ErrPermissionDenied, err.Error())
 		}
+	} else if !s.AllowUnboundTranscriptSigning {
+		return nil, fmt.Errorf("%w: transcript validator is required (or set AllowUnboundTranscriptSigning)", ErrPermissionDenied)
 	}
 
 	signer, err := s.Store.Signer(ctx, req.KeyID)
@@ -104,10 +107,7 @@ func (s *Service) SignTranscript(ctx context.Context, req *signrpc.TranscriptSig
 		return nil, fmt.Errorf("%w: %s", ErrPermissionDenied, err.Error())
 	}
 
-	transcriptHash, err := computeTranscriptHash(req)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrInvalidArgument, err.Error())
-	}
+	transcriptHash := computeTranscriptHash(req)
 
 	content := FormatCertificateVerifyContent(transcriptHash)
 	digest, err := hashContentForAlgorithm(content, req.Algorithm)
@@ -137,30 +137,16 @@ func FormatCertificateVerifyContent(transcriptHash []byte) []byte {
 	return out
 }
 
-func computeTranscriptHash(req *signrpc.TranscriptSignRequest) ([]byte, error) {
-	switch req.Algorithm {
-	case signrpc.AlgorithmECDSASHA384, signrpc.AlgorithmRSAPSSSHA384, signrpc.AlgorithmRSAPKCS1v15SHA384:
-		h := sha512.New384()
-		h.Write(req.ClientHello)
-		h.Write(req.ServerHello)
-		h.Write(req.EncryptedExtensions)
-		h.Write(req.Certificate)
-		return h.Sum(nil), nil
-	case signrpc.AlgorithmECDSASHA512, signrpc.AlgorithmRSAPSSSHA512, signrpc.AlgorithmRSAPKCS1v15SHA512:
-		h := sha512.New()
-		h.Write(req.ClientHello)
-		h.Write(req.ServerHello)
-		h.Write(req.EncryptedExtensions)
-		h.Write(req.Certificate)
-		return h.Sum(nil), nil
-	default:
-		h := sha256.New()
-		h.Write(req.ClientHello)
-		h.Write(req.ServerHello)
-		h.Write(req.EncryptedExtensions)
-		h.Write(req.Certificate)
-		return h.Sum(nil), nil
-	}
+// computeTranscriptHash computes the TLS 1.3 transcript hash.
+// In RFC 8446 Section 7.1, the transcript hash is determined by the cipher suite
+// (here TLS_AES_128_GCM_SHA256, so SHA-256), not by the CertificateVerify signature algorithm.
+func computeTranscriptHash(req *signrpc.TranscriptSignRequest) []byte {
+	h := sha256.New()
+	h.Write(req.ClientHello)
+	h.Write(req.ServerHello)
+	h.Write(req.EncryptedExtensions)
+	h.Write(req.Certificate)
+	return h.Sum(nil)
 }
 
 func hashContentForAlgorithm(content []byte, algorithm string) ([]byte, error) {

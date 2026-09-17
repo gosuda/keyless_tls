@@ -1,7 +1,6 @@
 package t13server
 
 import (
-	"context"
 	"net"
 )
 
@@ -22,30 +21,22 @@ func NewListener(inner net.Listener, server *Server, bindingProvider BindingProv
 }
 
 func (l *Listener) Accept() (net.Conn, error) {
-	for {
-		raw, err := l.inner.Accept()
+	raw, err := l.inner.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	var binding []byte
+	if l.bindingProvider != nil {
+		b, err := l.bindingProvider(raw)
 		if err != nil {
+			_ = raw.Close()
 			return nil, err
 		}
-
-		var binding []byte
-		if l.bindingProvider != nil {
-			b, err := l.bindingProvider(raw)
-			if err != nil {
-				_ = raw.Close()
-				continue
-			}
-			binding = b
-		}
-
-		conn, err := l.server.ServeConn(context.Background(), raw, binding)
-		if err != nil {
-			// Handshake failed; close and accept next connection
-			continue
-		}
-
-		return conn, nil
+		binding = b
 	}
+
+	return l.server.NewConn(raw, binding), nil
 }
 
 func (l *Listener) Close() error {

@@ -32,14 +32,24 @@ const (
 )
 
 type clientHelloInfo struct {
-	raw                []byte
-	random             []byte
-	legacySessionID    []byte
-	serverName         string
-	alpnProtocols      []string
-	signatureSchemes   []uint16
-	x25519KeyShare     []byte
-	hasTLS13Version    bool
+	raw              []byte
+	random           []byte
+	legacySessionID  []byte
+	serverName       string
+	alpnProtocols    []string
+	signatureSchemes []uint16
+	x25519KeyShare   []byte
+	hasTLS13Version  bool
+	hasAES128GCM     bool
+}
+
+func (ch *clientHelloInfo) hasSignatureScheme(scheme uint16) bool {
+	for _, s := range ch.signatureSchemes {
+		if s == scheme {
+			return true
+		}
+	}
+	return false
 }
 
 func parseClientHello(data []byte) (*clientHelloInfo, error) {
@@ -91,6 +101,13 @@ func parseClientHello(data []byte) (*clientHelloInfo, error) {
 	if len(payload) < pos+cipherSuitesLen {
 		return nil, errors.New("truncated client hello (cipher suites)")
 	}
+	hasAES128GCM := false
+	csBytes := payload[pos : pos+cipherSuitesLen]
+	for i := 0; i+2 <= len(csBytes); i += 2 {
+		if binary.BigEndian.Uint16(csBytes[i:i+2]) == 0x1301 {
+			hasAES128GCM = true
+		}
+	}
 	pos += cipherSuitesLen
 
 	// legacy_compression_methods (1 byte len + bytes)
@@ -119,6 +136,7 @@ func parseClientHello(data []byte) (*clientHelloInfo, error) {
 		raw:             data[:4+msgLen],
 		random:          random,
 		legacySessionID: sessionID,
+		hasAES128GCM:    hasAES128GCM,
 	}
 
 	extPos := 0

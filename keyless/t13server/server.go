@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/gosuda/keyless_tls/relay/signrpc"
 )
@@ -36,6 +37,8 @@ type Config struct {
 	KeyID string
 	// TranscriptSigner performs remote transcript-bound signing.
 	TranscriptSigner TranscriptSigner
+	// HandshakeTimeout is the maximum duration allowed for the TLS handshake. Defaults to 10s.
+	HandshakeTimeout time.Duration
 }
 
 type Server struct {
@@ -92,12 +95,20 @@ func NewServer(cfg Config) (*Server, error) {
 	}, nil
 }
 
+func (s *Server) NewConn(raw net.Conn, binding []byte) *Conn {
+	timeout := s.cfg.HandshakeTimeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	return newConn(raw, binding, s, timeout)
+}
+
 func (s *Server) ServeConn(ctx context.Context, raw net.Conn, binding []byte) (*Conn, error) {
 	if raw == nil {
 		return nil, errors.New("raw connection is nil")
 	}
-	conn := newConn(raw, binding)
-	if err := conn.handshake(ctx, s); err != nil {
+	conn := s.NewConn(raw, binding)
+	if err := conn.HandshakeContext(ctx); err != nil {
 		_ = raw.Close()
 		return nil, err
 	}

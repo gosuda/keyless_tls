@@ -21,6 +21,9 @@ type Conn struct {
 	raw     net.Conn
 	binding []byte
 
+	server           *Server
+	handshakeTimeout time.Duration
+
 	state ConnectionState
 
 	inCipher  *recordCipher
@@ -31,15 +34,19 @@ type Conn struct {
 
 	writeMu sync.Mutex
 
+	handshakeOnce     sync.Once
+	handshakeErr      error
 	handshakeComplete bool
 }
 
-func newConn(raw net.Conn, binding []byte) *Conn {
+func newConn(raw net.Conn, binding []byte, s *Server, timeout time.Duration) *Conn {
 	bindingCopy := make([]byte, len(binding))
 	copy(bindingCopy, binding)
 	return &Conn{
-		raw:     raw,
-		binding: bindingCopy,
+		raw:              raw,
+		binding:          bindingCopy,
+		server:           s,
+		handshakeTimeout: timeout,
 	}
 }
 
@@ -53,9 +60,33 @@ func (c *Conn) ConnectionState() ConnectionState {
 	return c.state
 }
 
+func (c *Conn) HandshakeContext(ctx context.Context) error {
+	c.handshakeOnce.Do(func() {
+		c.handshakeErr = c.handshake(ctx, c.server)
+	})
+	return c.handshakeErr
+}
+
+func (c *Conn) ensureHandshake() error {
+	c.handshakeOnce.Do(func() {
+		timeout := c.handshakeTimeout
+		if timeout <= 0 {
+			timeout = 10 * time.Second
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		c.handshakeErr = c.handshake(ctx, c.server)
+	})
+	return c.handshakeErr
+}
+
 func (c *Conn) Read(b []byte) (int, error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
+
+	if err := c.ensureHandshake(); err != nil {
+		return 0, err
+	}
 
 	for len(c.readBuf) == 0 {
 		innerType, payload, err := c.inCipher.decryptRecord(c.raw)
@@ -77,6 +108,10 @@ func (c *Conn) Read(b []byte) (int, error) {
 func (c *Conn) Write(b []byte) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+
+	if err := c.ensureHandshake(); err != nil {
+		return 0, err
+	}
 
 	total := 0
 	for len(b) > 0 {
@@ -136,8 +171,14 @@ func (c *Conn) handshake(ctx context.Context, s *Server) error {
 	if !ch.hasTLS13Version {
 		return errors.New("client does not support TLS 1.3")
 	}
+	if !ch.hasAES128GCM {
+		return errors.New("client does not support TLS_AES_128_GCM_SHA256 (0x1301)")
+	}
 	if len(ch.x25519KeyShare) != 32 {
 		return errors.New("client did not provide X25519 key share")
+	}
+	if !ch.hasSignatureScheme(s.sigScheme) {
+		return fmt.Errorf("client does not support server signature scheme 0x%04x", s.sigScheme)
 	}
 
 	// 2. Select ALPN

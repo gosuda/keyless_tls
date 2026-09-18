@@ -114,6 +114,8 @@ func (s *RemoteSigner) SignTranscript(ctx context.Context, req *signrpc.Transcri
 	}
 	if req.KeyID == "" {
 		req.KeyID = s.keyID
+	} else if req.KeyID != s.keyID {
+		return nil, fmt.Errorf("sign request key ID mismatch: got %q, want %q", req.KeyID, s.keyID)
 	}
 	if req.Nonce == "" {
 		nonce, err := randomHex(16)

@@ -144,6 +144,21 @@ func TestNewRemoteSigner_WithoutMTLS(t *testing.T) {
 	defer rs.Close()
 }
 
+func TestRemoteSignerSignTranscript_RejectsConfiguredKeyIDMismatch(t *testing.T) {
+	rSigner := &RemoteSigner{keyID: "relay-cert"}
+
+	_, err := rSigner.SignTranscript(context.Background(), &signrpc.TranscriptSignRequest{
+		KeyID:     "other-key",
+		Algorithm: signrpc.AlgorithmECDSASHA256,
+	})
+	if err == nil {
+		t.Fatal("expected key ID mismatch error")
+	}
+	if !strings.Contains(err.Error(), "sign request key ID mismatch") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestSignEndpoint_DefaultsToHTTPS(t *testing.T) {
 	got, err := signEndpoint("127.0.0.1:9443")
 	if err != nil {

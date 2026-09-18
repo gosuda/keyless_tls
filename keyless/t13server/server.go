@@ -84,7 +84,7 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 
 	if len(cfg.NextProtos) == 0 {
-		cfg.NextProtos = []string{"h2", "http/1.1"}
+		cfg.NextProtos = []string{"http/1.1"}
 	}
 
 	return &Server{

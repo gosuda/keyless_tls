@@ -62,7 +62,7 @@ func (c *Conn) ConnectionState() ConnectionState {
 
 func (c *Conn) HandshakeContext(ctx context.Context) error {
 	c.handshakeOnce.Do(func() {
-		c.handshakeErr = c.handshake(ctx, c.server)
+		c.handshakeErr = c.doHandshake(ctx)
 	})
 	return c.handshakeErr
 }
@@ -75,9 +75,45 @@ func (c *Conn) ensureHandshake() error {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		c.handshakeErr = c.handshake(ctx, c.server)
+		c.handshakeErr = c.doHandshake(ctx)
 	})
 	return c.handshakeErr
+}
+
+func (c *Conn) doHandshake(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = c.raw.SetDeadline(deadline)
+	} else if c.handshakeTimeout > 0 {
+		_ = c.raw.SetDeadline(time.Now().Add(c.handshakeTimeout))
+	}
+	defer func() {
+		_ = c.raw.SetDeadline(time.Time{})
+	}()
+
+	if ctx.Done() != nil {
+		done := make(chan struct{})
+		defer close(done)
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = c.raw.SetDeadline(time.Unix(1, 0))
+			case <-done:
+			}
+		}()
+	}
+
+	err := c.handshake(ctx, c.server)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return err
+	}
+	return nil
 }
 
 func (c *Conn) Read(b []byte) (int, error) {
@@ -97,7 +133,14 @@ func (c *Conn) Read(b []byte) (int, error) {
 			c.readBuf = payload
 			break
 		}
-		// Ignore other post-handshake inner types or handle alerts
+		if innerType == recordTypeHandshake {
+			var msgType byte
+			if len(payload) > 0 {
+				msgType = payload[0]
+			}
+			return 0, fmt.Errorf("tls: unsupported post-handshake handshake message type 0x%02x", msgType)
+		}
+		return 0, fmt.Errorf("tls: unsupported record inner type 0x%02x", innerType)
 	}
 
 	n := copy(b, c.readBuf)
@@ -135,15 +178,17 @@ func (c *Conn) Write(b []byte) (int, error) {
 }
 
 func (c *Conn) Close() error {
-	// Attempt sending encrypted close_notify alert if handshake was complete
+	// Attempt sending encrypted close_notify alert if handshake was complete.
+	// Best-effort: use TryLock so Close() is never blocked by a concurrent Write().
 	if c.handshakeComplete && c.outCipher != nil {
-		c.writeMu.Lock()
-		closeNotifyAlert := []byte{0x01, 0x00} // warning, close_notify
-		if rec, err := c.outCipher.encryptRecord(recordTypeAlert, closeNotifyAlert); err == nil {
-			_ = c.raw.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
-			_, _ = c.raw.Write(rec)
+		if c.writeMu.TryLock() {
+			closeNotifyAlert := []byte{0x01, 0x00} // warning, close_notify
+			if rec, err := c.outCipher.encryptRecord(recordTypeAlert, closeNotifyAlert); err == nil {
+				_ = c.raw.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+				_, _ = c.raw.Write(rec)
+			}
+			c.writeMu.Unlock()
 		}
-		c.writeMu.Unlock()
 	}
 	return c.raw.Close()
 }
@@ -155,13 +200,10 @@ func (c *Conn) SetReadDeadline(t time.Time) error  { return c.raw.SetReadDeadlin
 func (c *Conn) SetWriteDeadline(t time.Time) error { return c.raw.SetWriteDeadline(t) }
 
 func (c *Conn) handshake(ctx context.Context, s *Server) error {
-	// 1. Read ClientHello
-	recType, chPayload, err := readPlaintextRecord(c.raw)
+	// 1. Read ClientHello (accumulated across record boundaries)
+	chPayload, err := readPlaintextHandshakeMessage(c.raw)
 	if err != nil {
 		return fmt.Errorf("read client hello: %w", err)
-	}
-	if recType != recordTypeHandshake {
-		return fmt.Errorf("expected handshake record, got %x", recType)
 	}
 
 	ch, err := parseClientHello(chPayload)

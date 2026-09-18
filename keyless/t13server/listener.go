@@ -21,22 +21,24 @@ func NewListener(inner net.Listener, server *Server, bindingProvider BindingProv
 }
 
 func (l *Listener) Accept() (net.Conn, error) {
-	raw, err := l.inner.Accept()
-	if err != nil {
-		return nil, err
-	}
-
-	var binding []byte
-	if l.bindingProvider != nil {
-		b, err := l.bindingProvider(raw)
+	for {
+		raw, err := l.inner.Accept()
 		if err != nil {
-			_ = raw.Close()
 			return nil, err
 		}
-		binding = b
-	}
 
-	return l.server.NewConn(raw, binding), nil
+		var binding []byte
+		if l.bindingProvider != nil {
+			b, err := l.bindingProvider(raw)
+			if err != nil {
+				_ = raw.Close()
+				continue
+			}
+			binding = b
+		}
+
+		return l.server.NewConn(raw, binding), nil
+	}
 }
 
 func (l *Listener) Close() error {

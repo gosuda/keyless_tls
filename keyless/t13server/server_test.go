@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -732,24 +733,35 @@ func TestTLS13Server_AcceptDoesNotBlockOnStalledClient(t *testing.T) {
 	t13Lis := t13server.NewListener(rawLis, srv, nil)
 	defer t13Lis.Close()
 
+	stalledErrCh := make(chan error, 1)
+	var connCount int32
+	var countMu sync.Mutex
+
 	// Server accept loop
-	acceptedConns := make(chan net.Conn, 10)
 	go func() {
 		for {
 			conn, err := t13Lis.Accept()
 			if err != nil {
 				return
 			}
-			acceptedConns <- conn
+			countMu.Lock()
+			idx := connCount
+			connCount++
+			countMu.Unlock()
+
 			// Handle each accepted connection concurrently
-			go func(c net.Conn) {
+			go func(c net.Conn, isStalled bool) {
 				defer c.Close()
 				buf := make([]byte, 64)
-				n, _ := c.Read(buf)
+				n, readErr := c.Read(buf)
+				if isStalled {
+					stalledErrCh <- readErr
+					return
+				}
 				if n > 0 {
 					_, _ = c.Write([]byte("ok"))
 				}
-			}(conn)
+			}(conn, idx == 0)
 		}
 	}()
 
@@ -787,5 +799,430 @@ func TestTLS13Server_AcceptDoesNotBlockOnStalledClient(t *testing.T) {
 	if string(resp[:n]) != "ok" {
 		t.Fatalf("unexpected response from client 2: %s", string(resp[:n]))
 	}
+
+	// 3. Verify that the stalled connection terminates and returns a timeout error
+	select {
+	case err := <-stalledErrCh:
+		if err == nil {
+			t.Fatal("expected stalled connection read to fail with timeout error, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for stalled connection to terminate")
+	}
 }
+
+func TestTLS13Server_HandshakeContextCancellation(t *testing.T) {
+	certPEM, keyPEM, err := testutil.GenerateCert("example.com", false)
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+	priv, err := parseECDSAPrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("parse key: %v", err)
+	}
+	signerSvc := &signer.Service{
+		Store:                         &mockCryptoSignerStore{priv: priv},
+		AllowUnboundTranscriptSigning: true,
+	}
+	srv, err := t13server.NewServer(t13server.Config{
+		CertPEM:          certPEM,
+		KeyID:            "test-key",
+		TranscriptSigner: signerSvc,
+		HandshakeTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer rawLis.Close()
+
+	clientConn, err := net.Dial("tcp", rawLis.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer clientConn.Close()
+
+	serverRaw, err := rawLis.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	defer serverRaw.Close()
+
+	conn := srv.NewConn(serverRaw, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	errCh := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		errCh <- conn.HandshakeContext(ctx)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got: %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+			t.Fatalf("handshake cancellation took too long: %v", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandshakeContext was not unblocked by context cancellation")
+	}
+}
+
+func TestTLS13Server_ListenerBindingProviderErrorContinues(t *testing.T) {
+	certPEM, keyPEM, err := testutil.GenerateCert("example.com", false)
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+	priv, err := parseECDSAPrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("parse key: %v", err)
+	}
+	signerSvc := &signer.Service{
+		Store:                         &mockCryptoSignerStore{priv: priv},
+		AllowUnboundTranscriptSigning: true,
+	}
+	srv, err := t13server.NewServer(t13server.Config{
+		CertPEM:          certPEM,
+		KeyID:            "test-key",
+		TranscriptSigner: signerSvc,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer rawLis.Close()
+
+	var attemptCount int32
+	var countMu sync.Mutex
+	bindingProvider := func(raw net.Conn) ([]byte, error) {
+		countMu.Lock()
+		defer countMu.Unlock()
+		attemptCount++
+		if attemptCount == 1 {
+			return nil, errors.New("simulated binding extraction failure")
+		}
+		return []byte("valid-binding"), nil
+	}
+
+	t13Lis := t13server.NewListener(rawLis, srv, bindingProvider)
+	defer t13Lis.Close()
+
+	acceptedCh := make(chan net.Conn, 1)
+	go func() {
+		conn, err := t13Lis.Accept()
+		if err != nil {
+			return
+		}
+		acceptedCh <- conn
+		go func() {
+			buf := make([]byte, 16)
+			_, _ = conn.Read(buf)
+		}()
+	}()
+
+	// 1st dial: should be rejected by binding provider and closed by listener
+	conn1, err := net.Dial("tcp", rawLis.Addr().String())
+	if err != nil {
+		t.Fatalf("dial 1: %v", err)
+	}
+	defer conn1.Close()
+
+	buf := make([]byte, 1)
+	_ = conn1.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	_, err = conn1.Read(buf)
+	if err == nil {
+		t.Fatal("expected connection 1 to be closed by server listener")
+	}
+
+	// 2nd dial: standard TLS dial should succeed and be returned by Accept()
+	rootPool := x509.NewCertPool()
+	rootPool.AppendCertsFromPEM(certPEM)
+	conn2, err := tls.Dial("tcp", rawLis.Addr().String(), &tls.Config{
+		ServerName: "example.com",
+		RootCAs:    rootPool,
+		MinVersion: tls.VersionTLS13,
+	})
+	if err != nil {
+		t.Fatalf("dial 2: %v", err)
+	}
+	defer conn2.Close()
+	_, _ = conn2.Write([]byte("ping"))
+
+	select {
+	case c := <-acceptedCh:
+		defer c.Close()
+		t13Conn, ok := c.(*t13server.Conn)
+		if !ok {
+			t.Fatalf("expected *t13server.Conn, got %T", c)
+		}
+		if string(t13Conn.Binding()) != "valid-binding" {
+			t.Fatalf("unexpected binding: %q", string(t13Conn.Binding()))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Accept did not return second connection after first one failed binding provider")
+	}
+}
+
+func TestTLS13Server_CloseUnblocksWrite(t *testing.T) {
+	certPEM, keyPEM, err := testutil.GenerateCert("example.com", false)
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+	priv, err := parseECDSAPrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("parse key: %v", err)
+	}
+	signerSvc := &signer.Service{
+		Store:                         &mockCryptoSignerStore{priv: priv},
+		AllowUnboundTranscriptSigning: true,
+	}
+	srv, err := t13server.NewServer(t13server.Config{
+		CertPEM:          certPEM,
+		KeyID:            "test-key",
+		TranscriptSigner: signerSvc,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	clientRaw, serverRaw := net.Pipe()
+	defer clientRaw.Close()
+
+	rootPool := x509.NewCertPool()
+	rootPool.AppendCertsFromPEM(certPEM)
+	tlsClient := tls.Client(clientRaw, &tls.Config{
+		ServerName: "example.com",
+		RootCAs:    rootPool,
+		MinVersion: tls.VersionTLS13,
+	})
+
+	serverConn := srv.NewConn(serverRaw, nil)
+	hsErrCh := make(chan error, 2)
+	go func() {
+		hsErrCh <- tlsClient.Handshake()
+	}()
+	go func() {
+		hsErrCh <- serverConn.HandshakeContext(context.Background())
+	}()
+
+	for i := 0; i < 2; i++ {
+		if err := <-hsErrCh; err != nil {
+			t.Fatalf("handshake failed: %v", err)
+		}
+	}
+
+	writeErrCh := make(chan error, 1)
+	go func() {
+		_, err := serverConn.Write([]byte("blocked payload"))
+		writeErrCh <- err
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	closeErrCh := make(chan error, 1)
+	go func() {
+		closeErrCh <- serverConn.Close()
+	}()
+
+	select {
+	case err := <-closeErrCh:
+		if err != nil {
+			t.Logf("Close returned error: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("serverConn.Close() hung waiting on writeMu")
+	}
+
+	select {
+	case <-writeErrCh:
+		// Successfully unblocked
+	case <-time.After(1 * time.Second):
+		t.Fatal("serverConn.Write() was not unblocked by Close()")
+	}
+}
+
+type splitFirstRecordConn struct {
+	net.Conn
+	splitDone bool
+}
+
+func (s *splitFirstRecordConn) Write(b []byte) (int, error) {
+	if !s.splitDone && len(b) > 5 && b[0] == 0x16 {
+		s.splitDone = true
+		recPayload := b[5:]
+		if len(recPayload) > 20 {
+			part1 := recPayload[:20]
+			part2 := recPayload[20:]
+
+			rec1 := make([]byte, 5+len(part1))
+			copy(rec1, b[:5])
+			rec1[3] = byte(len(part1) >> 8)
+			rec1[4] = byte(len(part1))
+			copy(rec1[5:], part1)
+
+			rec2 := make([]byte, 5+len(part2))
+			copy(rec2, b[:5])
+			rec2[3] = byte(len(part2) >> 8)
+			rec2[4] = byte(len(part2))
+			copy(rec2[5:], part2)
+
+			if _, err := s.Conn.Write(rec1); err != nil {
+				return 0, err
+			}
+			if _, err := s.Conn.Write(rec2); err != nil {
+				return 0, err
+			}
+			return len(b), nil
+		}
+	}
+	return s.Conn.Write(b)
+}
+
+func TestTLS13Server_FragmentedClientHello(t *testing.T) {
+	certPEM, keyPEM, err := testutil.GenerateCert("example.com", false)
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+	priv, err := parseECDSAPrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("parse key: %v", err)
+	}
+	signerSvc := &signer.Service{
+		Store:                         &mockCryptoSignerStore{priv: priv},
+		AllowUnboundTranscriptSigning: true,
+	}
+	srv, err := t13server.NewServer(t13server.Config{
+		CertPEM:          certPEM,
+		KeyID:            "test-key",
+		TranscriptSigner: signerSvc,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer rawLis.Close()
+
+	go func() {
+		raw, err := rawLis.Accept()
+		if err != nil {
+			return
+		}
+		defer raw.Close()
+		conn, err := srv.ServeConn(context.Background(), raw, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		buf := make([]byte, 64)
+		n, _ := conn.Read(buf)
+		_, _ = conn.Write(append([]byte("echo: "), buf[:n]...))
+	}()
+
+	clientRaw, err := net.Dial("tcp", rawLis.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer clientRaw.Close()
+
+	wrappedClient := &splitFirstRecordConn{Conn: clientRaw}
+	rootPool := x509.NewCertPool()
+	rootPool.AppendCertsFromPEM(certPEM)
+
+	tlsClient := tls.Client(wrappedClient, &tls.Config{
+		ServerName: "example.com",
+		RootCAs:    rootPool,
+		MinVersion: tls.VersionTLS13,
+	})
+	defer tlsClient.Close()
+
+	if _, err := tlsClient.Write([]byte("ping")); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	buf := make([]byte, 64)
+	n, err := tlsClient.Read(buf)
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	if string(buf[:n]) != "echo: ping" {
+		t.Fatalf("unexpected echo response: %s", string(buf[:n]))
+	}
+}
+
+func TestTLS13Server_DefaultALPNIsHTTP11(t *testing.T) {
+	certPEM, keyPEM, err := testutil.GenerateCert("example.com", false)
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+	priv, err := parseECDSAPrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("parse key: %v", err)
+	}
+	signerSvc := &signer.Service{
+		Store:                         &mockCryptoSignerStore{priv: priv},
+		AllowUnboundTranscriptSigning: true,
+	}
+	srv, err := t13server.NewServer(t13server.Config{
+		CertPEM:          certPEM,
+		KeyID:            "test-key",
+		TranscriptSigner: signerSvc,
+		// NextProtos intentionally omitted to test default
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	clientRaw, serverRaw := net.Pipe()
+	defer clientRaw.Close()
+	defer serverRaw.Close()
+
+	rootPool := x509.NewCertPool()
+	rootPool.AppendCertsFromPEM(certPEM)
+	client := tls.Client(clientRaw, &tls.Config{
+		ServerName: "example.com",
+		RootCAs:    rootPool,
+		NextProtos: []string{"h2", "http/1.1"},
+		MinVersion: tls.VersionTLS13,
+	})
+
+	serverConn := srv.NewConn(serverRaw, nil)
+	hsErrCh := make(chan error, 2)
+	go func() {
+		hsErrCh <- client.Handshake()
+	}()
+	go func() {
+		hsErrCh <- serverConn.HandshakeContext(context.Background())
+	}()
+
+	for i := 0; i < 2; i++ {
+		if err := <-hsErrCh; err != nil {
+			t.Fatalf("handshake failed: %v", err)
+		}
+	}
+
+	if client.ConnectionState().NegotiatedProtocol != "http/1.1" {
+		t.Fatalf("expected negotiated protocol http/1.1, got %q", client.ConnectionState().NegotiatedProtocol)
+	}
+	if serverConn.ConnectionState().NegotiatedProtocol != "http/1.1" {
+		t.Fatalf("expected server negotiated protocol http/1.1, got %q", serverConn.ConnectionState().NegotiatedProtocol)
+	}
+}
+
 

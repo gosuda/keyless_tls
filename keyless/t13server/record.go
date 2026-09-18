@@ -15,8 +15,9 @@ const (
 	recordTypeHandshake        = 0x16
 	recordTypeApplicationData  = 0x17
 
-	maxPlaintextLength  = 16384 // 2^14 bytes
-	maxCiphertextLength = 16384 + 256
+	maxPlaintextLength        = 16384 // 2^14 bytes
+	maxCiphertextLength       = 16384 + 256
+	maxHandshakeMessageLength = 65536
 )
 
 var (
@@ -176,6 +177,34 @@ func readPlaintextRecord(r io.Reader) (byte, []byte, error) {
 		}
 
 		return recType, payload, nil
+	}
+}
+
+// readPlaintextHandshakeMessage reads plaintext TLS records from r until a complete
+// handshake message is accumulated across record boundaries.
+// It skips middlebox compatibility ChangeCipherSpec records.
+func readPlaintextHandshakeMessage(r io.Reader) ([]byte, error) {
+	var msgBuf []byte
+	for {
+		recType, recPayload, err := readPlaintextRecord(r)
+		if err != nil {
+			return nil, err
+		}
+		if recType != recordTypeHandshake {
+			return nil, fmt.Errorf("%w: expected handshake record (0x16), got 0x%02x", errBadRecordType, recType)
+		}
+		msgBuf = append(msgBuf, recPayload...)
+
+		if len(msgBuf) >= 4 {
+			msgLen := int(msgBuf[1])<<16 | int(msgBuf[2])<<8 | int(msgBuf[3])
+			fullLen := 4 + msgLen
+			if fullLen > maxHandshakeMessageLength {
+				return nil, errors.New("handshake message exceeds maximum allowed length")
+			}
+			if len(msgBuf) >= fullLen {
+				return msgBuf[:fullLen], nil
+			}
+		}
 	}
 }
 

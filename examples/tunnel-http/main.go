@@ -20,12 +20,18 @@ type tlsListener struct {
 	tlsSrv *t13server.Server
 }
 
+// connBinding is the application-specific value bound into every
+// CertificateVerify transcript this example produces. A real deployment
+// would derive it per connection (e.g. tenant or route identity) and a
+// relay-side TranscriptValidator would authorize against it.
+var connBinding = []byte("examples/tunnel-http")
+
 func (l *tlsListener) Accept() (net.Conn, error) {
 	raw, err := l.Listener.Accept()
 	if err != nil {
 		return nil, err
 	}
-	return l.tlsSrv.NewConn(raw, nil), nil
+	return l.tlsSrv.NewConn(raw, connBinding), nil
 }
 
 func main() {

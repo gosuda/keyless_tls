@@ -293,8 +293,15 @@ go run ./cmd/relay-signer \
   -key-id relay-cert \
   -tls-cert certs/relay-server.crt \
   -tls-key certs/relay-server.key \
-  -sign-key certs/relay-signing.key
+  -sign-key certs/relay-signing.key \
+  -allow-unbound-transcript-signing
 ```
+
+`/v1/sign` is fail-closed by default: the signer refuses every request unless a
+`TranscriptValidator` is configured. `-allow-unbound-transcript-signing` is a
+demo-mode opt-in that skips binding validation so the quick start can complete
+handshakes; production deployments must instead deploy a validator that
+authorizes the request's `binding` (and transcript) field.
 
 2) Run tunnel app
 
@@ -399,7 +406,8 @@ go run ./cmd/relay-signer \
   -tls-cert certs/relay-server.crt \
   -tls-key certs/relay-server.key \
   -client-ca certs/client-ca.crt \
-  -sign-key certs/relay-signing.key
+  -sign-key certs/relay-signing.key \
+  -allow-unbound-transcript-signing
 
 go run ./examples/tunnel-http \
   -listen :8443 \

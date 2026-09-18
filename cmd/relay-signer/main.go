@@ -14,12 +14,13 @@ import (
 
 func main() {
 	var (
-		listenAddr = flag.String("listen", ":9443", "HTTPS signer listen address")
-		keyID      = flag.String("key-id", "default", "key identifier exposed to clients")
-		certPath   = flag.String("tls-cert", "", "server TLS certificate PEM path")
-		keyPath    = flag.String("tls-key", "", "server TLS private key PEM path")
-		clientCA   = flag.String("client-ca", "", "client CA PEM path")
-		signKey    = flag.String("sign-key", "", "keyless signing private key PEM path")
+		listenAddr   = flag.String("listen", ":9443", "HTTPS signer listen address")
+		keyID        = flag.String("key-id", "default", "key identifier exposed to clients")
+		certPath     = flag.String("tls-cert", "", "server TLS certificate PEM path")
+		keyPath      = flag.String("tls-key", "", "server TLS private key PEM path")
+		clientCA     = flag.String("client-ca", "", "client CA PEM path")
+		signKey      = flag.String("sign-key", "", "keyless signing private key PEM path")
+		allowUnbound = flag.Bool("allow-unbound-transcript-signing", false, "accept /v1/sign requests without a TranscriptValidator (demo mode; production must deploy a validator)")
 	)
 	flag.Parse()
 
@@ -28,6 +29,9 @@ func main() {
 	required(*signKey, "sign-key")
 	if *clientCA == "" {
 		log.Println("WARNING: -client-ca not set, mTLS client verification disabled")
+	}
+	if *allowUnbound {
+		log.Println("WARNING: -allow-unbound-transcript-signing is enabled; /v1/sign signs CertificateVerify transcripts without binding validation (demo mode)")
 	}
 
 	certPEM := mustRead(*certPath)
@@ -56,7 +60,10 @@ func main() {
 		ServerCertPEM: certPEM,
 		ServerKeyPEM:  keyPEM,
 		ClientCAPEM:   caPEM,
-		SignerService: &signer.Service{Store: store},
+		SignerService: &signer.Service{
+			Store:                         store,
+			AllowUnboundTranscriptSigning: *allowUnbound,
+		},
 	})
 	if err != nil {
 		log.Fatalf("signer server exited: %v", err)

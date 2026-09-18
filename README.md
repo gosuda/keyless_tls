@@ -80,7 +80,7 @@ func main() {
         RootCAPEM:     mustRead("certs/relay-ca.crt"),
         ClientCertPEM: mustRead("certs/tunnel-client.crt"),
         ClientKeyPEM:  mustRead("certs/tunnel-client.key"),
-    }, certPEM)
+    })
     if err != nil {
         log.Fatal(err)
     }

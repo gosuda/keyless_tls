@@ -91,7 +91,7 @@ func TestSignHandler_Success(t *testing.T) {
 
 	body, err := json.Marshal(signrpc.TranscriptSignRequest{
 		KeyID:               "relay-cert",
-		Algorithm:           signrpc.AlgorithmRSAPKCS1v15SHA256,
+		Algorithm:           signrpc.AlgorithmRSAPSSSHA256,
 		Binding:             []byte{0x01},
 		ClientHello:         []byte("client-hello"),
 		ServerHello:         []byte("server-hello"),
@@ -136,7 +136,7 @@ func TestSignHandler_RejectsLegacyDigestContract(t *testing.T) {
 	digest := sha256.Sum256([]byte("hello"))
 	body, err := json.Marshal(map[string]any{
 		"key_id":         "relay-cert",
-		"algorithm":      signrpc.AlgorithmRSAPKCS1v15SHA256,
+		"algorithm":      signrpc.AlgorithmRSAPSSSHA256,
 		"digest":         digest[:],
 		"timestamp_unix": time.Now().Unix(),
 		"nonce":          "abc",
@@ -178,7 +178,7 @@ func TestSignHandler_MapsServiceError(t *testing.T) {
 	h := signHandler(&signer.Service{Store: staticStore{err: io.EOF}})
 	body, err := json.Marshal(signrpc.TranscriptSignRequest{
 		KeyID:               "relay-cert",
-		Algorithm:           signrpc.AlgorithmRSAPKCS1v15SHA256,
+		Algorithm:           signrpc.AlgorithmRSAPSSSHA256,
 		Binding:             []byte{0x01},
 		ClientHello:         []byte("client-hello"),
 		ServerHello:         []byte("server-hello"),

@@ -67,7 +67,7 @@ func main() {
 		remoteSignerCfg.RootCAPEM = mustRead(*rootCAPath)
 	}
 
-	rSigner, err := keyless.NewRemoteSigner(remoteSignerCfg, certPEM)
+	rSigner, err := keyless.NewRemoteSigner(remoteSignerCfg)
 	if err != nil {
 		log.Fatalf("create remote transcript signer: %v", err)
 	}

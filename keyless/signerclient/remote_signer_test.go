@@ -119,10 +119,6 @@ func TestNewRemoteSigner_RequiresServerName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create client cert: %v", err)
 	}
-	serverCertPEM, _, err := testutil.GenerateCert("relay.internal", false)
-	if err != nil {
-		t.Fatalf("create server cert: %v", err)
-	}
 
 	_, err = NewRemoteSigner(RemoteSignerConfig{
 		Endpoint:      "relay.internal:9443",
@@ -130,23 +126,18 @@ func TestNewRemoteSigner_RequiresServerName(t *testing.T) {
 		RootCAPEM:     rootCAPEM,
 		ClientCertPEM: clientCertPEM,
 		ClientKeyPEM:  clientKeyPEM,
-	}, serverCertPEM)
+	})
 	if err == nil {
 		t.Fatal("expected NewRemoteSigner to require server name")
 	}
 }
 
 func TestNewRemoteSigner_WithoutMTLS(t *testing.T) {
-	serverCertPEM, _, err := testutil.GenerateCert("relay.internal", false)
-	if err != nil {
-		t.Fatalf("create server cert: %v", err)
-	}
-
 	rs, err := NewRemoteSigner(RemoteSignerConfig{
 		Endpoint:   "relay.internal:9443",
 		ServerName: "relay.internal",
 		KeyID:      "relay-cert",
-	}, serverCertPEM)
+	})
 	if err != nil {
 		t.Fatalf("NewRemoteSigner() error = %v", err)
 	}
@@ -263,7 +254,7 @@ func TestRemoteSignerSignTranscript_HTTPJSON(t *testing.T) {
 		ClientCertPEM: clientCertPEM,
 		ClientKeyPEM:  clientKeyPEM,
 		Timeout:       2 * time.Second,
-	}, relayCertPEM)
+	})
 	if err != nil {
 		t.Fatalf("NewRemoteSigner() error = %v", err)
 	}
@@ -333,7 +324,7 @@ func TestRemoteSignerSignTranscript_DynamicHeaders(t *testing.T) {
 			token := fmt.Sprintf("token-%d", headerCalls.Add(1))
 			return http.Header{"X-Portal-Access-Token": []string{token}}
 		},
-	}, relayCertPEM)
+	})
 	if err != nil {
 		t.Fatalf("NewRemoteSigner() error = %v", err)
 	}
@@ -395,7 +386,7 @@ func TestRemoteSignerSignTranscript_HTTPError(t *testing.T) {
 		ClientCertPEM: clientCertPEM,
 		ClientKeyPEM:  clientKeyPEM,
 		Timeout:       2 * time.Second,
-	}, relayCertPEM)
+	})
 	if err != nil {
 		t.Fatalf("NewRemoteSigner() error = %v", err)
 	}
@@ -414,5 +405,94 @@ func TestRemoteSignerSignTranscript_HTTPError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "bad request") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRemoteSignerSignTranscript_ResponseValidation(t *testing.T) {
+	serverCertPEM, serverKeyPEM, err := testutil.GenerateCert("relay.internal", false)
+	if err != nil {
+		t.Fatalf("create server cert: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		resp    signrpc.TranscriptSignResponse
+		wantErr string
+	}{
+		{
+			name: "key id mismatch",
+			resp: signrpc.TranscriptSignResponse{
+				KeyID:     "wrong-key",
+				Algorithm: signrpc.AlgorithmECDSASHA256,
+				Signature: []byte("sig"),
+			},
+			wantErr: "key ID mismatch",
+		},
+		{
+			name: "algorithm mismatch",
+			resp: signrpc.TranscriptSignResponse{
+				KeyID:     "relay-cert",
+				Algorithm: signrpc.AlgorithmRSAPSSSHA256,
+				Signature: []byte("sig"),
+			},
+			wantErr: "algorithm mismatch",
+		},
+		{
+			name: "empty signature",
+			resp: signrpc.TranscriptSignResponse{
+				KeyID:     "relay-cert",
+				Algorithm: signrpc.AlgorithmECDSASHA256,
+				Signature: nil,
+			},
+			wantErr: "signature is empty",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc(signrpc.SignPath, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(tt.resp)
+			})
+
+			ts := httptest.NewUnstartedServer(mux)
+			cert, err := tls.X509KeyPair(serverCertPEM, serverKeyPEM)
+			if err != nil {
+				t.Fatalf("load server keypair: %v", err)
+			}
+			ts.TLS = &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{cert}}
+			ts.StartTLS()
+			defer ts.Close()
+
+			relayCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]})
+			rSigner, err := NewRemoteSigner(RemoteSignerConfig{
+				Endpoint:   strings.TrimPrefix(ts.URL, "https://"),
+				ServerName: "relay.internal",
+				KeyID:      "relay-cert",
+				RootCAPEM:  relayCertPEM,
+				Timeout:    2 * time.Second,
+			})
+			if err != nil {
+				t.Fatalf("NewRemoteSigner() error = %v", err)
+			}
+			defer rSigner.Close()
+
+			_, err = rSigner.SignTranscript(context.Background(), &signrpc.TranscriptSignRequest{
+				KeyID:               "relay-cert",
+				Algorithm:           signrpc.AlgorithmECDSASHA256,
+				Binding:             []byte{0x01},
+				ClientHello:         []byte("client-hello"),
+				ServerHello:         []byte("server-hello"),
+				EncryptedExtensions: []byte("encrypted-extensions"),
+				Certificate:         []byte("certificate"),
+			})
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected error containing %q, got: %v", tt.wantErr, err)
+			}
+		})
 	}
 }

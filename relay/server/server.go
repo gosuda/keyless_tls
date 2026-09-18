@@ -69,7 +69,7 @@ func signHandler(service *signer.Service) http.Handler {
 			return
 		}
 
-		r.Body = http.MaxBytesReader(w, r.Body, 128<<10) // 128 KiB for full cert chains and handshake fragments
+		r.Body = http.MaxBytesReader(w, r.Body, 512<<10) // 512 KiB for full cert chains and handshake fragments
 		defer r.Body.Close()
 		var req signrpc.TranscriptSignRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

@@ -3,13 +3,11 @@ package signerclient
 import (
 	"bytes"
 	"context"
-	"crypto"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/http"
@@ -21,15 +19,14 @@ import (
 )
 
 type RemoteSigner struct {
-	keyID     string
-	publicKey crypto.PublicKey
-	endpoint  string
-	client    *http.Client
-	timeout   time.Duration
-	headers   func() http.Header
+	keyID    string
+	endpoint string
+	client   *http.Client
+	timeout  time.Duration
+	headers  func() http.Header
 }
 
-func NewRemoteSigner(cfg RemoteSignerConfig, certPEM []byte) (*RemoteSigner, error) {
+func NewRemoteSigner(cfg RemoteSignerConfig) (*RemoteSigner, error) {
 	cfg.applyDefaults()
 	if cfg.Endpoint == "" {
 		return nil, errors.New("endpoint is required")
@@ -44,14 +41,6 @@ func NewRemoteSigner(cfg RemoteSignerConfig, certPEM []byte) (*RemoteSigner, err
 	hasKey := len(cfg.ClientKeyPEM) > 0
 	if hasCert != hasKey {
 		return nil, errors.New("client certificate and key must both be provided or both be empty")
-	}
-	if len(certPEM) == 0 {
-		return nil, errors.New("certificate PEM is required")
-	}
-
-	pub, err := parsePublicKeyFromCert(certPEM)
-	if err != nil {
-		return nil, err
 	}
 
 	tlsConf, err := signerTLSConfig(cfg)
@@ -72,12 +61,11 @@ func NewRemoteSigner(cfg RemoteSignerConfig, certPEM []byte) (*RemoteSigner, err
 	client := &http.Client{Transport: transport}
 
 	return &RemoteSigner{
-		keyID:     cfg.KeyID,
-		publicKey: pub,
-		endpoint:  endpoint,
-		client:    client,
-		timeout:   cfg.Timeout,
-		headers:   cfg.Headers,
+		keyID:    cfg.KeyID,
+		endpoint: endpoint,
+		client:   client,
+		timeout:  cfg.Timeout,
+		headers:  cfg.Headers,
 	}, nil
 }
 
@@ -118,10 +106,6 @@ func signerTLSConfig(cfg RemoteSignerConfig) (*tls.Config, error) {
 
 func (s *RemoteSigner) KeyID() string {
 	return s.keyID
-}
-
-func (s *RemoteSigner) Public() crypto.PublicKey {
-	return s.publicKey
 }
 
 func (s *RemoteSigner) SignTranscript(ctx context.Context, req *signrpc.TranscriptSignRequest) (*signrpc.TranscriptSignResponse, error) {
@@ -195,6 +179,16 @@ func (s *RemoteSigner) SignTranscript(ctx context.Context, req *signrpc.Transcri
 		return nil, fmt.Errorf("decode transcript sign response: %w", err)
 	}
 
+	if resp.KeyID != req.KeyID {
+		return nil, fmt.Errorf("signer response key ID mismatch: got %q, want %q", resp.KeyID, req.KeyID)
+	}
+	if resp.Algorithm != req.Algorithm {
+		return nil, fmt.Errorf("signer response algorithm mismatch: got %q, want %q", resp.Algorithm, req.Algorithm)
+	}
+	if len(resp.Signature) == 0 {
+		return nil, errors.New("signer response signature is empty")
+	}
+
 	return &resp, nil
 }
 
@@ -240,18 +234,6 @@ func signEndpoint(endpoint string) (string, error) {
 	}
 
 	return "https://" + strings.TrimRight(endpoint, "/") + signrpc.SignPath, nil
-}
-
-func parsePublicKeyFromCert(certPEM []byte) (crypto.PublicKey, error) {
-	block, _ := pem.Decode(certPEM)
-	if block == nil {
-		return nil, errors.New("invalid certificate PEM")
-	}
-	parsed, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("parse certificate: %w", err)
-	}
-	return parsed.PublicKey, nil
 }
 
 func randomHex(size int) (string, error) {

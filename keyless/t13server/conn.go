@@ -477,6 +477,15 @@ func (c *Conn) handshake(ctx context.Context, s *Server) error {
 	if err != nil {
 		return fmt.Errorf("remote transcript signing: %w", err)
 	}
+	if sigResp.KeyID != sigReq.KeyID {
+		return fmt.Errorf("remote transcript signing: response key ID mismatch: got %q, want %q", sigResp.KeyID, sigReq.KeyID)
+	}
+	if sigResp.Algorithm != sigReq.Algorithm {
+		return fmt.Errorf("remote transcript signing: response algorithm mismatch: got %q, want %q", sigResp.Algorithm, sigReq.Algorithm)
+	}
+	if len(sigResp.Signature) == 0 {
+		return errors.New("remote transcript signing: response signature is empty")
+	}
 
 	cvBytes := buildCertificateVerify(s.sigScheme, sigResp.Signature)
 

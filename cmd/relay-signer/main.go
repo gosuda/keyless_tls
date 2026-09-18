@@ -19,8 +19,9 @@ func main() {
 		certPath     = flag.String("tls-cert", "", "server TLS certificate PEM path")
 		keyPath      = flag.String("tls-key", "", "server TLS private key PEM path")
 		clientCA     = flag.String("client-ca", "", "client CA PEM path")
-		signKey      = flag.String("sign-key", "", "keyless signing private key PEM path")
-		allowUnbound = flag.Bool("allow-unbound-transcript-signing", false, "accept /v1/sign requests without a TranscriptValidator (demo mode; production must deploy a validator)")
+		signKey                   = flag.String("sign-key", "", "keyless signing private key PEM path")
+		allowUnbound              = flag.Bool("allow-unbound-transcript-signing", false, "accept /v1/sign requests without a TranscriptValidator (demo mode; production must deploy a validator)")
+		allowInsecureNoClientAuth = flag.Bool("allow-insecure-no-client-auth", false, "permit running without client certificate verification (-client-ca) (insecure/demo mode)")
 	)
 	flag.Parse()
 
@@ -28,7 +29,10 @@ func main() {
 	required(*keyPath, "tls-key")
 	required(*signKey, "sign-key")
 	if *clientCA == "" {
-		log.Println("WARNING: -client-ca not set, mTLS client verification disabled")
+		if !*allowInsecureNoClientAuth {
+			log.Fatal("-client-ca is required by default (or set -allow-insecure-no-client-auth for insecure local/demo operation)")
+		}
+		log.Println("WARNING: -client-ca not set and -allow-insecure-no-client-auth is enabled, mTLS client verification disabled")
 	}
 	if *allowUnbound {
 		log.Println("WARNING: -allow-unbound-transcript-signing is enabled; /v1/sign signs CertificateVerify transcripts without binding validation (demo mode)")

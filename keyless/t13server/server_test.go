@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1920,5 +1921,113 @@ func TestTLS13Server_LargeCertificateChainFragmentation(t *testing.T) {
 	}
 	if string(buf) != "ping" {
 		t.Fatalf("unexpected application data: %q", buf)
+	}
+}
+
+type mockSignerFunc func(ctx context.Context, req *signrpc.TranscriptSignRequest) (*signrpc.TranscriptSignResponse, error)
+
+func (f mockSignerFunc) SignTranscript(ctx context.Context, req *signrpc.TranscriptSignRequest) (*signrpc.TranscriptSignResponse, error) {
+	return f(ctx, req)
+}
+
+func TestTLS13Server_SignerResponseValidation(t *testing.T) {
+	certPEM, keyPEM, err := testutil.GenerateCert("example.com", false)
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+	priv, err := parseECDSAPrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("parse key: %v", err)
+	}
+	realSigner := &signer.Service{
+		Store:                         &mockCryptoSignerStore{priv: priv},
+		AllowUnboundTranscriptSigning: true,
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(*signrpc.TranscriptSignResponse)
+		wantErr string
+	}{
+		{
+			name: "key id mismatch",
+			mutate: func(resp *signrpc.TranscriptSignResponse) {
+				resp.KeyID = "corrupted-key"
+			},
+			wantErr: "response key ID mismatch",
+		},
+		{
+			name: "algorithm mismatch",
+			mutate: func(resp *signrpc.TranscriptSignResponse) {
+				resp.Algorithm = "corrupted-alg"
+			},
+			wantErr: "response algorithm mismatch",
+		},
+		{
+			name: "empty signature",
+			mutate: func(resp *signrpc.TranscriptSignResponse) {
+				resp.Signature = nil
+			},
+			wantErr: "response signature is empty",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			signerMock := mockSignerFunc(func(ctx context.Context, req *signrpc.TranscriptSignRequest) (*signrpc.TranscriptSignResponse, error) {
+				resp, err := realSigner.SignTranscript(ctx, req)
+				if err != nil {
+					return nil, err
+				}
+				tt.mutate(resp)
+				return resp, nil
+			})
+
+			srv, err := t13server.NewServer(t13server.Config{
+				CertPEM:          certPEM,
+				KeyID:            "test-key",
+				TranscriptSigner: signerMock,
+			})
+			if err != nil {
+				t.Fatalf("new server: %v", err)
+			}
+
+			rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("listen: %v", err)
+			}
+			defer rawLis.Close()
+
+			serverErrCh := make(chan error, 1)
+			go func() {
+				serverRaw, err := rawLis.Accept()
+				if err != nil {
+					serverErrCh <- err
+					return
+				}
+				defer serverRaw.Close()
+				conn := srv.NewConn(serverRaw, nil)
+				serverErrCh <- conn.HandshakeContext(context.Background())
+			}()
+
+			rootPool := x509.NewCertPool()
+			rootPool.AppendCertsFromPEM(certPEM)
+			client, err := tls.Dial("tcp", rawLis.Addr().String(), &tls.Config{
+				ServerName: "example.com",
+				RootCAs:    rootPool,
+				MinVersion: tls.VersionTLS13,
+			})
+			if err == nil {
+				client.Close()
+			}
+
+			serverErr := <-serverErrCh
+			if serverErr == nil {
+				t.Fatal("expected server error, got nil")
+			}
+			if !strings.Contains(serverErr.Error(), tt.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tt.wantErr, serverErr)
+			}
+		})
 	}
 }

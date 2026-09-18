@@ -7,7 +7,6 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
-	"crypto/sha512"
 	"errors"
 	"fmt"
 	"time"
@@ -118,14 +117,8 @@ func computeTranscriptHash(req *signrpc.TranscriptSignRequest) []byte {
 
 func hashContentForAlgorithm(content []byte, algorithm string) ([]byte, error) {
 	switch algorithm {
-	case signrpc.AlgorithmECDSASHA256, signrpc.AlgorithmRSAPSSSHA256, signrpc.AlgorithmRSAPKCS1v15SHA256:
+	case signrpc.AlgorithmECDSASHA256, signrpc.AlgorithmRSAPSSSHA256:
 		h := sha256.Sum256(content)
-		return h[:], nil
-	case signrpc.AlgorithmECDSASHA384, signrpc.AlgorithmRSAPSSSHA384, signrpc.AlgorithmRSAPKCS1v15SHA384:
-		h := sha512.Sum384(content)
-		return h[:], nil
-	case signrpc.AlgorithmECDSASHA512, signrpc.AlgorithmRSAPSSSHA512, signrpc.AlgorithmRSAPKCS1v15SHA512:
-		h := sha512.Sum512(content)
 		return h[:], nil
 	case signrpc.AlgorithmEd25519:
 		return content, nil
@@ -142,22 +135,8 @@ func signByAlgorithm(signer crypto.Signer, digest []byte, algorithm string) ([]b
 	switch algorithm {
 	case signrpc.AlgorithmECDSASHA256:
 		return signer.Sign(rand.Reader, digest, crypto.SHA256)
-	case signrpc.AlgorithmECDSASHA384:
-		return signer.Sign(rand.Reader, digest, crypto.SHA384)
-	case signrpc.AlgorithmECDSASHA512:
-		return signer.Sign(rand.Reader, digest, crypto.SHA512)
-	case signrpc.AlgorithmRSAPKCS1v15SHA256:
-		return signer.Sign(rand.Reader, digest, crypto.SHA256)
-	case signrpc.AlgorithmRSAPKCS1v15SHA384:
-		return signer.Sign(rand.Reader, digest, crypto.SHA384)
-	case signrpc.AlgorithmRSAPKCS1v15SHA512:
-		return signer.Sign(rand.Reader, digest, crypto.SHA512)
 	case signrpc.AlgorithmRSAPSSSHA256:
 		return signer.Sign(rand.Reader, digest, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: crypto.SHA256})
-	case signrpc.AlgorithmRSAPSSSHA384:
-		return signer.Sign(rand.Reader, digest, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: crypto.SHA384})
-	case signrpc.AlgorithmRSAPSSSHA512:
-		return signer.Sign(rand.Reader, digest, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: crypto.SHA512})
 	case signrpc.AlgorithmEd25519:
 		return signer.Sign(rand.Reader, digest, crypto.Hash(0))
 	default:

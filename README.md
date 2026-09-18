@@ -301,6 +301,7 @@ go run ./cmd/relay-signer \
   -key-id relay-cert \
   -tls-cert certs/relay-server.crt \
   -tls-key certs/relay-server.key \
+  -client-ca certs/client-ca.crt \
   -sign-key certs/relay-signing.key \
   -allow-unbound-transcript-signing
 ```

@@ -8,7 +8,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -127,8 +126,36 @@ func (c *Conn) doHandshake(ctx context.Context) error {
 	_ = c.raw.SetReadDeadline(effectiveReadDeadline)
 	_ = c.raw.SetWriteDeadline(effectiveWriteDeadline)
 
-	// Restore caller-owned deadlines upon exiting handshake
+	// Bound the entire handshake — including the remote transcript signing
+	// round trip, which performs no socket I/O — by the same earliest-of
+	// limit. context.WithDeadline keeps the earlier of the caller deadline
+	// and handshakeLimit, so a shorter caller deadline still wins.
+	if !handshakeLimit.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, handshakeLimit)
+		defer cancel()
+	}
+
+	// Unblock raw I/O stuck on the socket when the caller cancels. The restore
+	// below joins the watcher (close(done) + <-watcherStopped) before touching
+	// deadlines, so a late SetDeadline(past) can never overwrite the restored
+	// caller-owned deadlines.
+	done := make(chan struct{})
+	watcherStopped := make(chan struct{})
+	go func() {
+		defer close(watcherStopped)
+		select {
+		case <-ctx.Done():
+			_ = c.raw.SetDeadline(time.Unix(1, 0))
+		case <-done:
+		}
+	}()
+
+	// Restore caller-owned deadlines upon exiting handshake.
 	defer func() {
+		close(done)
+		<-watcherStopped
+
 		c.deadlineMu.Lock()
 		rDeadline := c.readDeadline
 		wDeadline := c.writeDeadline
@@ -137,18 +164,6 @@ func (c *Conn) doHandshake(ctx context.Context) error {
 		_ = c.raw.SetReadDeadline(rDeadline)
 		_ = c.raw.SetWriteDeadline(wDeadline)
 	}()
-
-	if ctx.Done() != nil {
-		done := make(chan struct{})
-		defer close(done)
-		go func() {
-			select {
-			case <-ctx.Done():
-				_ = c.raw.SetDeadline(time.Unix(1, 0))
-			case <-done:
-			}
-		}()
-	}
 
 	err := c.handshake(ctx, c.server)
 	if err != nil {
@@ -500,14 +515,18 @@ func (c *Conn) handshake(ctx context.Context, s *Server) error {
 		return err
 	}
 
+	// PeerCertificates and VerifiedChains intentionally stay nil: this server
+	// does not perform client authentication, so there is no peer chain to
+	// report. The locally presented chain goes in LocalCertificate.
 	c.state = tls.ConnectionState{
-		Version:            tls.VersionTLS13,
-		HandshakeComplete:  true,
-		ServerName:         ch.serverName,
-		NegotiatedProtocol: negotiatedALPN,
-		CipherSuite:        0x1301,
-		PeerCertificates:   s.parsedChain,
-		VerifiedChains:     [][]*x509.Certificate{s.parsedChain},
+		Version:                    tls.VersionTLS13,
+		HandshakeComplete:          true,
+		ServerName:                 ch.serverName,
+		NegotiatedProtocol:         negotiatedALPN,
+		NegotiatedProtocolIsMutual: true,
+		CipherSuite:                tls.TLS_AES_128_GCM_SHA256,
+		CurveID:                    tls.X25519,
+		LocalCertificate:           s.cfg.Certificates,
 	}
 	c.handshakeComplete = true
 

@@ -41,9 +41,8 @@ type Config struct {
 type Server struct {
 	cfg Config
 
-	sigScheme   uint16
-	sigAlg      string
-	parsedChain []*x509.Certificate
+	sigScheme uint16
+	sigAlg    string
 }
 
 func NewServer(cfg Config) (*Server, error) {
@@ -71,13 +70,11 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, err
 	}
 
-	parsedChain := make([]*x509.Certificate, 0, len(cfg.Certificates))
+	// Validate the full chain eagerly; the parsed form is not needed afterwards.
 	for _, der := range cfg.Certificates {
-		c, err := x509.ParseCertificate(der)
-		if err != nil {
+		if _, err := x509.ParseCertificate(der); err != nil {
 			return nil, fmt.Errorf("parse certificate chain: %w", err)
 		}
-		parsedChain = append(parsedChain, c)
 	}
 
 	if len(cfg.NextProtos) == 0 {
@@ -85,10 +82,9 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 
 	return &Server{
-		cfg:         cfg,
-		sigScheme:   scheme,
-		sigAlg:      alg,
-		parsedChain: parsedChain,
+		cfg:       cfg,
+		sigScheme: scheme,
+		sigAlg:    alg,
 	}, nil
 }
 

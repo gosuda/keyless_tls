@@ -194,4 +194,3 @@ func TestSignTranscript_FailClosedWithoutValidator(t *testing.T) {
 		t.Fatal("empty signature")
 	}
 }
-

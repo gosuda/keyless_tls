@@ -7,11 +7,12 @@ import (
 )
 
 // hkdfLabel constructs the TLS 1.3 HkdfLabel structure according to RFC 8446 Section 7.1.
-// struct {
-//     uint16 length;
-//     opaque label<7..255>;
-//     opaque context<0..255>;
-// };
+//
+//	struct {
+//	    uint16 length;
+//	    opaque label<7..255>;
+//	    opaque context<0..255>;
+//	};
 func hkdfLabel(length int, label string, context []byte) []byte {
 	fullLabel := "tls13 " + label
 	out := make([]byte, 2+1+len(fullLabel)+1+len(context))

@@ -15,14 +15,14 @@ const (
 	handshakeTypeCertificateVerify   = 0x0f
 	handshakeTypeFinished            = 0x14
 
-	extensionServerName           = 0x0000
-	extensionSupportedGroups      = 0x000a
-	extensionSignatureAlgorithms  = 0x000d
-	extensionALPN                 = 0x0010
-	extensionSupportedVersions    = 0x002b
-	extensionKeyShare             = 0x0033
+	extensionServerName          = 0x0000
+	extensionSupportedGroups     = 0x000a
+	extensionSignatureAlgorithms = 0x000d
+	extensionALPN                = 0x0010
+	extensionSupportedVersions   = 0x002b
+	extensionKeyShare            = 0x0033
 
-	groupX25519 = 0x001d
+	groupX25519  = 0x001d
 	versionTLS13 = 0x0304
 
 	// Supported signature schemes

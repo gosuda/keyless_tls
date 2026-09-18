@@ -32,9 +32,9 @@ func (f TranscriptValidatorFunc) ValidateTranscript(ctx context.Context, req *si
 }
 
 type Service struct {
-	Store                        KeyStore
-	AllowedSkew                  time.Duration
-	TranscriptValidator          TranscriptValidator
+	Store                         KeyStore
+	AllowedSkew                   time.Duration
+	TranscriptValidator           TranscriptValidator
 	AllowUnboundTranscriptSigning bool
 }
 

@@ -413,11 +413,11 @@ func TestTLS13Server_NegativeMissing0x1301InClientHello(t *testing.T) {
 	go func() {
 		// Send a synthetic ClientHello offering only 0x1302 (TLS_AES_256_GCM_SHA384)
 		body := []byte{0x03, 0x03}                  // legacy version
-		body = append(body, make([]byte, 32)...)   // random
-		body = append(body, 0x00)                  // session id len 0
+		body = append(body, make([]byte, 32)...)    // random
+		body = append(body, 0x00)                   // session id len 0
 		body = append(body, 0x00, 0x02, 0x13, 0x02) // cipher suites (only 0x1302)
-		body = append(body, 0x01, 0x00)            // compression
-		body = append(body, 0x00, 0x00)            // extensions len 0
+		body = append(body, 0x01, 0x00)             // compression
+		body = append(body, 0x00, 0x00)             // extensions len 0
 
 		msg := []byte{0x01, 0x00, byte(len(body) >> 8), byte(len(body))}
 		msg = append(msg, body...)
@@ -1413,4 +1413,301 @@ func TestTLS13Server_CallerDeadlinePreservedAfterHandshake(t *testing.T) {
 	}
 }
 
+// blockingSigner records whether it received a context carrying a deadline,
+// then blocks until that context is done and returns its error.
+type blockingSigner struct {
+	mu          sync.Mutex
+	sawDeadline bool
+}
 
+func (b *blockingSigner) SignTranscript(ctx context.Context, _ *signrpc.TranscriptSignRequest) (*signrpc.TranscriptSignResponse, error) {
+	if d, ok := ctx.Deadline(); ok && !d.IsZero() {
+		b.mu.Lock()
+		b.sawDeadline = true
+		b.mu.Unlock()
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (b *blockingSigner) observedDeadline() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sawDeadline
+}
+
+// deadlineRecorder records deadline calls that reach the raw connection.
+type deadlineRecorder struct {
+	net.Conn
+
+	mu       sync.Mutex
+	reads    []time.Time
+	writes   []time.Time
+	combined []time.Time
+}
+
+func (d *deadlineRecorder) SetReadDeadline(t time.Time) error {
+	d.mu.Lock()
+	d.reads = append(d.reads, t)
+	d.mu.Unlock()
+	return d.Conn.SetReadDeadline(t)
+}
+
+func (d *deadlineRecorder) SetWriteDeadline(t time.Time) error {
+	d.mu.Lock()
+	d.writes = append(d.writes, t)
+	d.mu.Unlock()
+	return d.Conn.SetWriteDeadline(t)
+}
+
+func (d *deadlineRecorder) SetDeadline(t time.Time) error {
+	d.mu.Lock()
+	d.combined = append(d.combined, t)
+	d.mu.Unlock()
+	return d.Conn.SetDeadline(t)
+}
+
+func (d *deadlineRecorder) snapshot() (reads, writes []time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]time.Time(nil), d.reads...), append([]time.Time(nil), d.writes...)
+}
+
+func TestTLS13Server_HandshakeTimeoutBoundsRemoteSigning(t *testing.T) {
+	// Acceptance criterion: HandshakeTimeout must bound the entire handshake,
+	// including the remote transcript-signing round trip (which performs no
+	// socket I/O), even when the caller passes an unbounded context — the
+	// shape produced when http.Server invokes HandshakeContext itself.
+	certPEM, _, err := testutil.GenerateCert("example.com", false)
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+	signerSvc := &blockingSigner{}
+	srv, err := t13server.NewServer(t13server.Config{
+		CertPEM:          certPEM,
+		KeyID:            "test-key",
+		TranscriptSigner: signerSvc,
+		HandshakeTimeout: 300 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer rawLis.Close()
+
+	clientRaw, err := net.Dial("tcp", rawLis.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer clientRaw.Close()
+
+	rootPool := x509.NewCertPool()
+	rootPool.AppendCertsFromPEM(certPEM)
+	client := tls.Client(clientRaw, &tls.Config{
+		ServerName: "example.com",
+		RootCAs:    rootPool,
+		MinVersion: tls.VersionTLS13,
+	})
+	go func() { _ = client.Handshake() }() // its error is irrelevant; the server is the subject
+
+	serverRaw, err := rawLis.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	defer serverRaw.Close()
+
+	conn := srv.NewConn(serverRaw, nil)
+
+	errCh := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		errCh <- conn.HandshakeContext(context.Background())
+	}()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected context.DeadlineExceeded, got: %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("handshake not bounded by HandshakeTimeout: %v", elapsed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("HandshakeTimeout did not bound the remote signing round trip")
+	}
+
+	if !signerSvc.observedDeadline() {
+		t.Fatal("remote signer did not receive a context carrying the handshake deadline")
+	}
+}
+
+func TestTLS13Server_CtxCancelRestoresDeadlinesAfterWatcher(t *testing.T) {
+	// Acceptance criterion: the cancellation watcher must be fully joined
+	// before caller-owned deadlines are restored, so a late
+	// SetDeadline(past) from the watcher can never overwrite the restore.
+	certPEM, _, err := testutil.GenerateCert("example.com", false)
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+	srv, err := t13server.NewServer(t13server.Config{
+		CertPEM:          certPEM,
+		KeyID:            "test-key",
+		TranscriptSigner: &blockingSigner{},
+		HandshakeTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer rawLis.Close()
+
+	clientRaw, err := net.Dial("tcp", rawLis.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer clientRaw.Close()
+
+	serverRaw, err := rawLis.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	recorder := &deadlineRecorder{Conn: serverRaw}
+	defer recorder.Close()
+
+	conn := srv.NewConn(recorder, nil)
+
+	expectedDeadline := time.Now().Add(10 * time.Second)
+	if err := conn.SetReadDeadline(expectedDeadline); err != nil {
+		t.Fatalf("set caller read deadline: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- conn.HandshakeContext(ctx)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandshakeContext was not unblocked by context cancellation")
+	}
+
+	// Give any racy late watcher ample opportunity to clobber the restore.
+	time.Sleep(200 * time.Millisecond)
+
+	reads, writes := recorder.snapshot()
+	if last := reads[len(reads)-1]; !last.Equal(expectedDeadline) {
+		t.Fatalf("caller read deadline not left restored: got %v, want %v", last, expectedDeadline)
+	}
+	if last := writes[len(writes)-1]; !last.IsZero() {
+		t.Fatalf("write deadline not restored to zero after handshake: got %v", last)
+	}
+}
+
+func TestTLS13Server_ConnectionStateServerSemantics(t *testing.T) {
+	// Acceptance criterion: ConnectionState follows stdlib server-side
+	// semantics — PeerCertificates and VerifiedChains describe the peer's
+	// chain and stay empty without client authentication, while the chain
+	// presented by this server appears in LocalCertificate.
+	certPEM, keyPEM, err := testutil.GenerateCert("example.com", false)
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+	priv, err := parseECDSAPrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("parse key: %v", err)
+	}
+	signerSvc := &signer.Service{
+		Store:                         &mockCryptoSignerStore{priv: priv},
+		AllowUnboundTranscriptSigning: true,
+	}
+	srv, err := t13server.NewServer(t13server.Config{
+		CertPEM:          certPEM,
+		KeyID:            "test-key",
+		TranscriptSigner: signerSvc,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer rawLis.Close()
+
+	clientRaw, err := net.Dial("tcp", rawLis.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer clientRaw.Close()
+
+	rootPool := x509.NewCertPool()
+	rootPool.AppendCertsFromPEM(certPEM)
+	client := tls.Client(clientRaw, &tls.Config{
+		ServerName: "example.com",
+		RootCAs:    rootPool,
+		MinVersion: tls.VersionTLS13,
+	})
+
+	serverRaw, err := rawLis.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	defer serverRaw.Close()
+
+	serverConn := srv.NewConn(serverRaw, nil)
+
+	hsErrCh := make(chan error, 2)
+	go func() {
+		hsErrCh <- client.Handshake()
+	}()
+	go func() {
+		hsErrCh <- serverConn.HandshakeContext(context.Background())
+	}()
+
+	for range 2 {
+		if err := <-hsErrCh; err != nil {
+			t.Fatalf("handshake failed: %v", err)
+		}
+	}
+
+	cs := serverConn.ConnectionState()
+	if !cs.HandshakeComplete || cs.Version != tls.VersionTLS13 {
+		t.Fatalf("unexpected state: complete=%v version=%x", cs.HandshakeComplete, cs.Version)
+	}
+	if cs.PeerCertificates != nil {
+		t.Fatal("PeerCertificates must be nil on a server connection without client authentication")
+	}
+	if cs.VerifiedChains != nil {
+		t.Fatal("VerifiedChains must be nil on a server connection without client authentication")
+	}
+	block, _ := pem.Decode(certPEM)
+	if block == nil || len(cs.LocalCertificate) == 0 || !bytes.Equal(cs.LocalCertificate[0], block.Bytes) {
+		t.Fatal("LocalCertificate must contain the server-presented leaf DER")
+	}
+	if cs.CipherSuite != tls.TLS_AES_128_GCM_SHA256 {
+		t.Fatalf("unexpected cipher suite: %x", cs.CipherSuite)
+	}
+	if cs.CurveID != tls.X25519 {
+		t.Fatalf("unexpected curve: %v", cs.CurveID)
+	}
+	if !cs.NegotiatedProtocolIsMutual {
+		t.Fatal("expected NegotiatedProtocolIsMutual true to match stdlib server behavior")
+	}
+}

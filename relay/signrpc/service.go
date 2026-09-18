@@ -53,4 +53,3 @@ type TranscriptSignResponse struct {
 type ErrorResponse struct {
 	Error string `json:"error"`
 }
-

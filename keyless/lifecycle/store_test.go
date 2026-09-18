@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -39,7 +40,7 @@ func TestDiskStoreSaveLoadAndPerms(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat state file: %v", err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("state file perms=%v want=0600", info.Mode().Perm())
 	}
 

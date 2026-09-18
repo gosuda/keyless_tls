@@ -34,7 +34,7 @@ func NewServerTLSConfig(cfg ServerTLSConfig) (*tls.Config, error) {
 		return nil, errors.New("certificate PEM is required")
 	}
 	if cfg.Signer == nil {
-		return nil, errors.New("remote signer is required")
+		return nil, errors.New("signer is required")
 	}
 
 	cert, err := newCertificate(cfg.CertPEM, cfg.Signer)

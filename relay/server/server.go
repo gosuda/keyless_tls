@@ -69,15 +69,15 @@ func signHandler(service *signer.Service) http.Handler {
 			return
 		}
 
-		r.Body = http.MaxBytesReader(w, r.Body, 4<<10) // 4 KiB
+		r.Body = http.MaxBytesReader(w, r.Body, 512<<10) // 512 KiB for full cert chains and handshake fragments
 		defer r.Body.Close()
-		var req signrpc.SignRequest
+		var req signrpc.TranscriptSignRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSONError(w, http.StatusBadRequest, "invalid json body")
 			return
 		}
 
-		resp, err := service.Sign(r.Context(), &req)
+		resp, err := service.SignTranscript(r.Context(), &req)
 		if err != nil {
 			status := http.StatusInternalServerError
 			switch {

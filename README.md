@@ -57,12 +57,17 @@ type keylessListener struct {
     tlsSrv *t13server.Server
 }
 
+// binding is application-specific authorization context carried with the
+// exact TLS transcript to the remote signer. Real deployments should derive
+// this per connection/route/tenant and validate it on the signer side.
+var binding = []byte("example-app")
+
 func (l *keylessListener) Accept() (net.Conn, error) {
     raw, err := l.Listener.Accept()
     if err != nil {
         return nil, err
     }
-    return l.tlsSrv.NewConn(raw, nil), nil
+    return l.tlsSrv.NewConn(raw, binding), nil
 }
 
 func main() {
@@ -113,7 +118,10 @@ func mustRead(path string) []byte {
 }
 ```
 
-A runnable version lives in `examples/tunnel-http`.
+A runnable version lives in `examples/tunnel-http`. The binding shown above is only an
+example value; production integrations should derive an opaque binding from the connection's
+authorization context and configure a `TranscriptValidator` that verifies that binding before
+the signer produces a CertificateVerify signature.
 
 If the signer endpoint is protected by a rotating access token, attach it with
 `RemoteSignerConfig.Headers`. The callback runs for every `/v1/sign` request and

@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -1709,5 +1710,215 @@ func TestTLS13Server_ConnectionStateServerSemantics(t *testing.T) {
 	}
 	if !cs.NegotiatedProtocolIsMutual {
 		t.Fatal("expected NegotiatedProtocolIsMutual true to match stdlib server behavior")
+	}
+}
+
+// monitorKickSigner delegates to an inner signer and invokes kick at signing
+// time — while the handshake is still finishing.
+type monitorKickSigner struct {
+	inner t13server.TranscriptSigner
+	kick  func()
+}
+
+func (m *monitorKickSigner) SignTranscript(ctx context.Context, req *signrpc.TranscriptSignRequest) (*signrpc.TranscriptSignResponse, error) {
+	m.kick()
+	return m.inner.SignTranscript(ctx, req)
+}
+
+func TestConn_ConnectionStateAndCloseConcurrentWithHandshakeCompletion(t *testing.T) {
+	// Acceptance criterion: ConnectionState() and Close() may be called while
+	// the handshake is finishing; handshake state publication must be
+	// synchronized (run with -race: unsynchronized access is flagged).
+	certPEM, keyPEM, err := testutil.GenerateCert("example.com", false)
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+	priv, err := parseECDSAPrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("parse key: %v", err)
+	}
+	inner := &signer.Service{
+		Store:                         &mockCryptoSignerStore{priv: priv},
+		AllowUnboundTranscriptSigning: true,
+	}
+
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer rawLis.Close()
+
+	clientRaw, err := net.Dial("tcp", rawLis.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer clientRaw.Close()
+
+	rootPool := x509.NewCertPool()
+	rootPool.AppendCertsFromPEM(certPEM)
+	client := tls.Client(clientRaw, &tls.Config{
+		ServerName: "example.com",
+		RootCAs:    rootPool,
+		MinVersion: tls.VersionTLS13,
+	})
+
+	serverRaw, err := rawLis.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	defer serverRaw.Close()
+
+	// The monitor starts spinning at signing time — right before the state
+	// publication — and keeps calling ConnectionState() until it observes
+	// completion, then races Close() against the finishing handshake.
+	var serverConn *t13server.Conn
+	signerSvc := &monitorKickSigner{
+		inner: inner,
+		kick: func() {
+			go func() {
+				for {
+					if serverConn.ConnectionState().HandshakeComplete {
+						_ = serverConn.Close()
+						return
+					}
+					runtime.Gosched()
+				}
+			}()
+		},
+	}
+
+	srv, err := t13server.NewServer(t13server.Config{
+		CertPEM:          certPEM,
+		KeyID:            "test-key",
+		TranscriptSigner: signerSvc,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	serverConn = srv.NewConn(serverRaw, nil)
+
+	hsErrCh := make(chan error, 2)
+	go func() {
+		hsErrCh <- client.Handshake()
+	}()
+	go func() {
+		hsErrCh <- serverConn.HandshakeContext(context.Background())
+	}()
+
+	for range 2 {
+		if err := <-hsErrCh; err != nil {
+			t.Fatalf("handshake failed: %v", err)
+		}
+	}
+
+	if !serverConn.ConnectionState().HandshakeComplete {
+		t.Fatal("expected handshake completion to be observable after handshake")
+	}
+}
+
+func TestTLS13Server_LargeCertificateChainFragmentation(t *testing.T) {
+	// Acceptance criterion: a Certificate handshake message larger than one
+	// TLS record (16 KiB) is fragmented across records on send and still
+	// interoperates with the standard Go client.
+	certPEM, keyPEM, err := testutil.GenerateCert("example.com", false)
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+	fillerPEM, _, err := testutil.GenerateCert("filler-intermediate", true)
+	if err != nil {
+		t.Fatalf("generate filler cert: %v", err)
+	}
+
+	// Pad the presented chain with valid parseable filler certificates until
+	// the Certificate handshake message must exceed one record.
+	var chainPEM []byte
+	chainPEM = append(chainPEM, certPEM...)
+	chainPEM = append(chainPEM, fillerPEM...)
+	for {
+		totalDER := 0
+		rest := chainPEM
+		for {
+			var block *pem.Block
+			block, rest = pem.Decode(rest)
+			if block == nil {
+				break
+			}
+			totalDER += 4 + 3 + 3 + len(block.Bytes)
+		}
+		if totalDER > 2*16384 {
+			break
+		}
+		chainPEM = append(chainPEM, fillerPEM...)
+	}
+
+	priv, err := parseECDSAPrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("parse key: %v", err)
+	}
+	signerSvc := &signer.Service{
+		Store:                         &mockCryptoSignerStore{priv: priv},
+		AllowUnboundTranscriptSigning: true,
+	}
+	srv, err := t13server.NewServer(t13server.Config{
+		CertPEM:          chainPEM,
+		KeyID:            "test-key",
+		TranscriptSigner: signerSvc,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer rawLis.Close()
+
+	clientRaw, err := net.Dial("tcp", rawLis.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer clientRaw.Close()
+
+	rootPool := x509.NewCertPool()
+	rootPool.AppendCertsFromPEM(certPEM) // leaf is self-signed; fillers are unused path candidates
+	client := tls.Client(clientRaw, &tls.Config{
+		ServerName: "example.com",
+		RootCAs:    rootPool,
+		MinVersion: tls.VersionTLS13,
+	})
+
+	serverRaw, err := rawLis.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	defer serverRaw.Close()
+
+	serverConn := srv.NewConn(serverRaw, nil)
+
+	hsErrCh := make(chan error, 2)
+	go func() {
+		hsErrCh <- client.Handshake()
+	}()
+	go func() {
+		hsErrCh <- serverConn.HandshakeContext(context.Background())
+	}()
+
+	for range 2 {
+		if err := <-hsErrCh; err != nil {
+			t.Fatalf("handshake failed: %v", err)
+		}
+	}
+
+	// Prove the connection is fully usable after the multi-record flight.
+	if _, err := client.Write([]byte("ping")); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(serverConn, buf); err != nil {
+		t.Fatalf("server read: %v", err)
+	}
+	if string(buf) != "ping" {
+		t.Fatalf("unexpected application data: %q", buf)
 	}
 }

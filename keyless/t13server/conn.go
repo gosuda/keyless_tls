@@ -31,6 +31,14 @@ type Conn struct {
 
 	state tls.ConnectionState
 
+	// stateMu guards the connection-visible handshake state below: state,
+	// handshakeComplete, inCipher and outCipher. Writers (the handshake) must
+	// publish under it; Close() and ConnectionState() must read under it, so
+	// concurrent callers always see a consistent snapshot. The Read/Write hot
+	// paths are ordered by handshakeOnce instead (every caller passes through
+	// handshakeOnce.Do before touching the ciphers).
+	stateMu sync.Mutex
+
 	inCipher  *recordCipher
 	outCipher *recordCipher
 
@@ -62,6 +70,8 @@ func (c *Conn) Binding() []byte {
 }
 
 func (c *Conn) ConnectionState() ConnectionState {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
 	return c.state
 }
 
@@ -246,10 +256,15 @@ func (c *Conn) Write(b []byte) (int, error) {
 func (c *Conn) Close() error {
 	// Attempt sending encrypted close_notify alert if handshake was complete.
 	// Best-effort: use TryLock so Close() is never blocked by a concurrent Write().
-	if c.handshakeComplete && c.outCipher != nil {
+	c.stateMu.Lock()
+	complete := c.handshakeComplete
+	outCipher := c.outCipher
+	c.stateMu.Unlock()
+
+	if complete && outCipher != nil {
 		if c.writeMu.TryLock() {
 			closeNotifyAlert := []byte{0x01, 0x00} // warning, close_notify
-			if rec, err := c.outCipher.encryptRecord(recordTypeAlert, closeNotifyAlert); err == nil {
+			if rec, err := outCipher.encryptRecord(recordTypeAlert, closeNotifyAlert); err == nil {
 				_ = c.raw.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
 				_, _ = c.raw.Write(rec)
 			}
@@ -282,6 +297,54 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 	c.writeDeadline = t
 	c.deadlineMu.Unlock()
 	return c.raw.SetWriteDeadline(t)
+}
+
+// writeEncryptedHandshakeMessage writes one handshake message (including its
+// 4-byte header), fragmenting it across as many encrypted records as needed.
+// RFC 8446 Section 5.1 allows a handshake message to span multiple records.
+func (c *Conn) writeEncryptedHandshakeMessage(cipher *recordCipher, msg []byte) error {
+	for len(msg) > 0 {
+		fragLen := len(msg)
+		if fragLen > maxPlaintextLength {
+			fragLen = maxPlaintextLength
+		}
+		rec, err := cipher.encryptRecord(recordTypeHandshake, msg[:fragLen])
+		if err != nil {
+			return err
+		}
+		if _, err := c.raw.Write(rec); err != nil {
+			return err
+		}
+		msg = msg[fragLen:]
+	}
+	return nil
+}
+
+// readEncryptedHandshakeMessage reads a single handshake message,
+// reassembling it from as many encrypted records as needed.
+func (c *Conn) readEncryptedHandshakeMessage(cipher *recordCipher) ([]byte, error) {
+	var msgBuf []byte
+	for {
+		innerType, payload, err := cipher.decryptRecord(c.raw)
+		if err != nil {
+			return nil, err
+		}
+		if innerType != recordTypeHandshake {
+			return nil, fmt.Errorf("%w: expected encrypted handshake record (0x16), got inner type 0x%02x", errBadRecordType, innerType)
+		}
+		msgBuf = append(msgBuf, payload...)
+
+		if len(msgBuf) >= 4 {
+			msgLen := int(msgBuf[1])<<16 | int(msgBuf[2])<<8 | int(msgBuf[3])
+			fullLen := 4 + msgLen
+			if fullLen > maxHandshakeMessageLength {
+				return nil, errors.New("handshake message exceeds maximum allowed length")
+			}
+			if len(msgBuf) >= fullLen {
+				return msgBuf[:fullLen], nil
+			}
+		}
+	}
 }
 
 func (c *Conn) handshake(ctx context.Context, s *Server) error {
@@ -433,39 +496,19 @@ func (c *Conn) handshake(ctx context.Context, s *Server) error {
 
 	sfBytes := buildFinishedMessage(serverVerifyData)
 
-	// Send Encrypted Server Flight (EE, Cert, CV, Finished)
-	var secondFlight []byte
-	recEE, err := serverHsCipher.encryptRecord(recordTypeHandshake, eeBytes)
-	if err != nil {
-		return err
-	}
-	recCert, err := serverHsCipher.encryptRecord(recordTypeHandshake, certBytes)
-	if err != nil {
-		return err
-	}
-	recCV, err := serverHsCipher.encryptRecord(recordTypeHandshake, cvBytes)
-	if err != nil {
-		return err
-	}
-	recSF, err := serverHsCipher.encryptRecord(recordTypeHandshake, sfBytes)
-	if err != nil {
-		return err
-	}
-	secondFlight = append(secondFlight, recEE...)
-	secondFlight = append(secondFlight, recCert...)
-	secondFlight = append(secondFlight, recCV...)
-	secondFlight = append(secondFlight, recSF...)
-	if _, err := c.raw.Write(secondFlight); err != nil {
-		return fmt.Errorf("send server encrypted flight: %w", err)
+	// Send Encrypted Server Flight (EE, Cert, CV, Finished). Each handshake
+	// message is fragmented across records by its own length, so a Certificate
+	// message larger than one record still fits (RFC 8446 Section 5.1).
+	for _, msg := range [][]byte{eeBytes, certBytes, cvBytes, sfBytes} {
+		if err := c.writeEncryptedHandshakeMessage(serverHsCipher, msg); err != nil {
+			return fmt.Errorf("send server encrypted flight: %w", err)
+		}
 	}
 
-	// 10. Receive Client Finished
-	cfRecType, cfBytes, err := clientHsCipher.decryptRecord(c.raw)
+	// 10. Receive Client Finished (reassembled across records if fragmented)
+	cfBytes, err := c.readEncryptedHandshakeMessage(clientHsCipher)
 	if err != nil {
 		return fmt.Errorf("read client finished: %w", err)
-	}
-	if cfRecType != recordTypeHandshake {
-		return fmt.Errorf("expected client handshake record, got %x", cfRecType)
 	}
 
 	clientVerifyData, err := parseFinished(cfBytes)
@@ -506,11 +549,11 @@ func (c *Conn) handshake(ctx context.Context, s *Server) error {
 	serverAppKey := hkdfExpandLabel(serverAppTrafficSecret, "key", nil, 16)
 	serverAppIV := hkdfExpandLabel(serverAppTrafficSecret, "iv", nil, 12)
 
-	c.inCipher, err = newRecordCipher(clientAppKey, clientAppIV)
+	clientAppCipher, err := newRecordCipher(clientAppKey, clientAppIV)
 	if err != nil {
 		return err
 	}
-	c.outCipher, err = newRecordCipher(serverAppKey, serverAppIV)
+	serverAppCipher, err := newRecordCipher(serverAppKey, serverAppIV)
 	if err != nil {
 		return err
 	}
@@ -518,7 +561,7 @@ func (c *Conn) handshake(ctx context.Context, s *Server) error {
 	// PeerCertificates and VerifiedChains intentionally stay nil: this server
 	// does not perform client authentication, so there is no peer chain to
 	// report. The locally presented chain goes in LocalCertificate.
-	c.state = tls.ConnectionState{
+	state := tls.ConnectionState{
 		Version:                    tls.VersionTLS13,
 		HandshakeComplete:          true,
 		ServerName:                 ch.serverName,
@@ -528,7 +571,15 @@ func (c *Conn) handshake(ctx context.Context, s *Server) error {
 		CurveID:                    tls.X25519,
 		LocalCertificate:           s.cfg.Certificates,
 	}
+
+	// Publish all connection-visible handshake state together so concurrent
+	// Close() / ConnectionState() readers observe a consistent snapshot.
+	c.stateMu.Lock()
+	c.inCipher = clientAppCipher
+	c.outCipher = serverAppCipher
+	c.state = state
 	c.handshakeComplete = true
+	c.stateMu.Unlock()
 
 	return nil
 }

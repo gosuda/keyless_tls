@@ -521,7 +521,7 @@ func TestTLS13Server_LargePayloadMultiRecord(t *testing.T) {
 
 func TestTLS13Server_E2ERemoteSignerOverHTTP(t *testing.T) {
 	// Full distributed E2E test:
-	// Relay Server running HTTP /v1/sign-transcript <--- RemoteSigner client <--- t13server
+	// Relay Server running HTTP /v1/sign <--- RemoteSigner client <--- t13server
 	certPEM, keyPEM, err := testutil.GenerateCert("example.com", false)
 	if err != nil {
 		t.Fatalf("generate cert: %v", err)
@@ -542,9 +542,9 @@ func TestTLS13Server_E2ERemoteSignerOverHTTP(t *testing.T) {
 		}),
 	}
 
-	// Start mock Relay HTTP server exposing /v1/sign-transcript
+	// Start mock Relay HTTP server exposing /v1/sign
 	relayMux := http.NewServeMux()
-	relayMux.HandleFunc(signrpc.TranscriptSignPath, func(w http.ResponseWriter, r *http.Request) {
+	relayMux.HandleFunc(signrpc.SignPath, func(w http.ResponseWriter, r *http.Request) {
 		var req signrpc.TranscriptSignRequest
 		if err := jsonDecode(r.Body, &req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -571,7 +571,7 @@ func TestTLS13Server_E2ERemoteSignerOverHTTP(t *testing.T) {
 
 	// Direct signer client calling the mock relay
 	remoteClient := &mockSignerClient{
-		endpoint: fmt.Sprintf("http://%s%s", relayLis.Addr().String(), signrpc.TranscriptSignPath),
+		endpoint: fmt.Sprintf("http://%s%s", relayLis.Addr().String(), signrpc.SignPath),
 	}
 
 	srv, err := t13server.NewServer(t13server.Config{

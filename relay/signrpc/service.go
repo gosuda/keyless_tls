@@ -1,8 +1,10 @@
 package signrpc
 
 const (
-	SignPath           = "/v1/sign"
-	TranscriptSignPath = "/v1/sign-transcript"
+	// SignPath is the single signer endpoint. Its wire contract is
+	// transcript-bound: the request carries the TLS handshake transcript and
+	// the response is its CertificateVerify signature.
+	SignPath = "/v1/sign"
 )
 
 const (
@@ -17,20 +19,6 @@ const (
 	AlgorithmRSAPSSSHA512      = "RSA_PSS_SHA512"
 	AlgorithmEd25519           = "Ed25519"
 )
-
-type SignRequest struct {
-	KeyID         string `json:"key_id"`
-	Algorithm     string `json:"algorithm"`
-	Digest        []byte `json:"digest"`
-	TimestampUnix int64  `json:"timestamp_unix"`
-	Nonce         string `json:"nonce"`
-}
-
-type SignResponse struct {
-	KeyID     string `json:"key_id"`
-	Algorithm string `json:"algorithm"`
-	Signature []byte `json:"signature"`
-}
 
 type TranscriptSignRequest struct {
 	KeyID               string `json:"key_id"`

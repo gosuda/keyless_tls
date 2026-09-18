@@ -38,39 +38,6 @@ type Service struct {
 	AllowUnboundTranscriptSigning bool
 }
 
-func (s *Service) Sign(ctx context.Context, req *signrpc.SignRequest) (*signrpc.SignResponse, error) {
-	if req == nil {
-		return nil, fmt.Errorf("%w: request is nil", ErrInvalidArgument)
-	}
-	if req.KeyID == "" || len(req.Digest) == 0 || req.Algorithm == "" || req.Nonce == "" {
-		return nil, fmt.Errorf("%w: missing required field", ErrInvalidArgument)
-	}
-	if s.Store == nil {
-		return nil, fmt.Errorf("%w: signer store is not configured", ErrInternal)
-	}
-
-	skew := s.AllowedSkew
-	if skew <= 0 {
-		skew = 30 * time.Second
-	}
-	now := time.Now().Unix()
-	if req.TimestampUnix < now-int64(skew.Seconds()) || req.TimestampUnix > now+int64(skew.Seconds()) {
-		return nil, fmt.Errorf("%w: request timestamp outside allowed skew", ErrInvalidArgument)
-	}
-
-	signer, err := s.Store.Signer(ctx, req.KeyID)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrPermissionDenied, err.Error())
-	}
-
-	sig, err := signByAlgorithm(signer, req.Digest, req.Algorithm)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrInvalidArgument, err.Error())
-	}
-
-	return &signrpc.SignResponse{KeyID: req.KeyID, Algorithm: req.Algorithm, Signature: sig}, nil
-}
-
 func (s *Service) SignTranscript(ctx context.Context, req *signrpc.TranscriptSignRequest) (*signrpc.TranscriptSignResponse, error) {
 	if req == nil {
 		return nil, fmt.Errorf("%w: request is nil", ErrInvalidArgument)

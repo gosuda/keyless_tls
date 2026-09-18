@@ -15,7 +15,7 @@ This repository supports two usage modes:
 
 ## Choose your integration path first
 
-- **I want to attach directly to my app (`http.Server`)**: SDK mode
+- **I want keyless remote signing for my TLS app**: transcript-bound keyless mode (`keyless` + `keyless/t13server`)
 - **I want to run it immediately and validate behavior**: Binary mode
 
 ---
@@ -25,57 +25,83 @@ This repository supports two usage modes:
 ### Core concept
 
 The tunnel app keeps only the public certificate chain (`cert PEM`) and does **not** hold the private key.
-The `keyless` SDK attaches a remote signer as if it were a `crypto.Signer`, so handshake signing is performed remotely.
+The `keyless` SDK provides a remote transcript signer: the TLS 1.3 handshake is performed by the tunnel
+app (via `keyless/t13server`), and only the `CertificateVerify` transcript signature is delegated to the
+remote signer over `/v1/sign`.
 
 ### Public APIs
 
-- `keyless.AttachToHTTPServer`: simplest entry point (attach directly to `http.Server`)
-- `keyless.NewRemoteSigner`: create a remote signer client explicitly
-- `keyless.NewServerTLSConfig`: build `tls.Config` manually
+- `keyless.NewRemoteSigner`: create a remote transcript signer client
+- `keyless/t13server`: TLS 1.3 server engine that signs its handshake through a `TranscriptSigner`
+  (it implements `net.Conn` and integrates with `http.Server`)
+- `keyless.NewServerTLSConfig`: build a `tls.Config` for deployments that hold a **local** private key
 
-### Easiest setup (`AttachToHTTPServer`)
+### Easiest setup (`NewRemoteSigner` + `t13server`)
 
 ```go
 package main
 
 import (
     "log"
+    "net"
     "net/http"
     "os"
 
     "github.com/gosuda/keyless_tls/keyless"
+    "github.com/gosuda/keyless_tls/keyless/t13server"
 )
+
+// keylessListener upgrades raw TCP connections into transcript-bound keyless TLS connections.
+type keylessListener struct {
+    net.Listener
+    tlsSrv *t13server.Server
+}
+
+func (l *keylessListener) Accept() (net.Conn, error) {
+    raw, err := l.Listener.Accept()
+    if err != nil {
+        return nil, err
+    }
+    return l.tlsSrv.NewConn(raw, nil), nil
+}
 
 func main() {
     certPEM := mustRead("certs/public-chain.crt")
+
+    rSigner, err := keyless.NewRemoteSigner(keyless.RemoteSignerConfig{
+        Endpoint:      "127.0.0.1:9443",
+        ServerName:    "relay.internal",
+        KeyID:         "relay-cert",
+        RootCAPEM:     mustRead("certs/relay-ca.crt"),
+        ClientCertPEM: mustRead("certs/tunnel-client.crt"),
+        ClientKeyPEM:  mustRead("certs/tunnel-client.key"),
+    }, certPEM)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer rSigner.Close()
+
+    tlsSrv, err := t13server.NewServer(t13server.Config{
+        CertPEM:          certPEM,
+        KeyID:            "relay-cert",
+        TranscriptSigner: rSigner,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    lis, err := net.Listen("tcp", ":8443")
+    if err != nil {
+        log.Fatal(err)
+    }
 
     mux := http.NewServeMux()
     mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
         _, _ = w.Write([]byte("ok\n"))
     })
 
-    srv := &http.Server{
-        Addr:    ":8443",
-        Handler: mux,
-    }
-
-    remoteSigner, err := keyless.AttachToHTTPServer(srv, keyless.HTTPServerAttachConfig{
-        CertPEM: certPEM,
-        RemoteSigner: keyless.RemoteSignerConfig{
-            Endpoint:   "127.0.0.1:9443",
-            ServerName: "relay.internal",
-            KeyID:      "relay-cert",
-            RootCAPEM:  mustRead("certs/relay-ca.crt"),
-            ClientCertPEM: mustRead("certs/tunnel-client.crt"),
-            ClientKeyPEM:  mustRead("certs/tunnel-client.key"),
-        },
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer remoteSigner.Close()
-
-    log.Fatal(srv.ListenAndServeTLS("", ""))
+    srv := &http.Server{Handler: mux}
+    log.Fatal(srv.Serve(&keylessListener{Listener: lis, tlsSrv: tlsSrv}))
 }
 
 func mustRead(path string) []byte {
@@ -87,28 +113,7 @@ func mustRead(path string) []byte {
 }
 ```
 
-### Advanced setup (`NewRemoteSigner` + `NewServerTLSConfig`)
-
-Use this when you already have your own `tls.Config` construction flow, or when integrating with components other than `http.Server`.
-
-```go
-rSigner, err := keyless.NewRemoteSigner(remoteSignerCfg, certPEM)
-if err != nil {
-    // handle error
-}
-defer rSigner.Close()
-
-tlsConf, err := keyless.NewServerTLSConfig(keyless.ServerTLSConfig{
-    CertPEM:    certPEM,
-    Signer:     rSigner,
-    NextProtos: []string{"h2", "http/1.1"},
-    // EncryptedClientHelloKeys: []tls.EncryptedClientHelloKey{echKey},
-    // MinVersion: tls.VersionTLS13,
-})
-if err != nil {
-    // handle error
-}
-```
+A runnable version lives in `examples/tunnel-http`.
 
 If the signer endpoint is protected by a rotating access token, attach it with
 `RemoteSignerConfig.Headers`. The callback runs for every `/v1/sign` request and
@@ -122,15 +127,20 @@ remoteSignerCfg.Headers = func() http.Header {
 }
 ```
 
+### Local-key deployments (`NewServerTLSConfig`)
+
+If a deployment holds its private key locally, `keyless.NewServerTLSConfig` builds a standard
+`tls.Config` for Go's TLS stack. This path does not involve the remote signer.
+
 ### Encrypted ClientHello (ECH)
 
-`keyless.NewServerTLSConfig` and `keyless.AttachToHTTPServer` can pass ECH
-keys through to Go's TLS stack:
+`keyless.NewServerTLSConfig` can pass ECH keys through to Go's TLS stack for
+local-key deployments:
 
 ```go
 tlsConf, err := keyless.NewServerTLSConfig(keyless.ServerTLSConfig{
     CertPEM: certPEM,
-    Signer:  rSigner,
+    Signer:  localSigner,
     EncryptedClientHelloKeys: []tls.EncryptedClientHelloKey{
         {
             Config:      echConfig,
@@ -412,13 +422,21 @@ go run ./examples/tunnel-http \
 
 ### Signer API contract (`/v1/sign`)
 
+The signing protocol has a **single endpoint with a transcript-bound contract**. The request
+carries the TLS 1.3 handshake transcript; the signer validates it and returns the
+`CertificateVerify` signature. There is no arbitrary-digest signing endpoint.
+
 Request:
 
 ```json
 {
   "key_id": "relay-cert",
   "algorithm": "RSA_PSS_SHA256",
-  "digest": "<base64>",
+  "binding": "<base64>",
+  "client_hello": "<base64>",
+  "server_hello": "<base64>",
+  "encrypted_extensions": "<base64>",
+  "certificate": "<base64>",
   "timestamp_unix": 1735628400,
   "nonce": "c4d76ad40f5d8f95a1fe4b2f1c922f4a"
 }
@@ -433,6 +451,21 @@ Response:
   "signature": "<base64>"
 }
 ```
+
+#### Wire compatibility matrix (intentional protocol break)
+
+The `/v1/sign` contract changed from the legacy digest-based schema to the transcript-bound
+schema above. This is an intentional breaking change: mixed old/new deployments are unsupported.
+
+| client \ server       | new server (transcript-bound)              | old server (≤ legacy digest schema)          |
+| --------------------- | ------------------------------------------ | -------------------------------------------- |
+| new client            | works                                      | broken: legacy server rejects the transcript request schema |
+| old client (digest)   | rejected with HTTP 400 (`missing required handshake transcript field`) | works (legacy) |
+
+The relay tests pin the break: a legacy digest-shaped request to `/v1/sign` is rejected with
+`400 Bad Request`, never silently reinterpreted. Deployments that still run the legacy digest
+contract must upgrade clients and servers together.
+
 
 ## Package structure
 

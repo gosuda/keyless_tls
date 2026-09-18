@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -81,16 +82,23 @@ func TestSignHandler_Success(t *testing.T) {
 	service := &signer.Service{
 		Store:       staticStore{signer: priv},
 		AllowedSkew: 30 * time.Second,
+		// The handler-level test exercises the signing path without a
+		// transcript validator; validator enforcement is covered in
+		// relay/signer tests.
+		AllowUnboundTranscriptSigning: true,
 	}
 	h := signHandler(service)
 
-	digest := sha256.Sum256([]byte("hello"))
-	body, err := json.Marshal(signrpc.SignRequest{
-		KeyID:         "relay-cert",
-		Algorithm:     signrpc.AlgorithmRSAPKCS1v15SHA256,
-		Digest:        digest[:],
-		TimestampUnix: time.Now().Unix(),
-		Nonce:         "abc",
+	body, err := json.Marshal(signrpc.TranscriptSignRequest{
+		KeyID:               "relay-cert",
+		Algorithm:           signrpc.AlgorithmRSAPKCS1v15SHA256,
+		Binding:             []byte{0x01},
+		ClientHello:         []byte("client-hello"),
+		ServerHello:         []byte("server-hello"),
+		EncryptedExtensions: []byte("encrypted-extensions"),
+		Certificate:         []byte("certificate"),
+		TimestampUnix:       time.Now().Unix(),
+		Nonce:               "abc",
 	})
 	if err != nil {
 		t.Fatalf("marshal request: %v", err)
@@ -106,7 +114,7 @@ func TestSignHandler_Success(t *testing.T) {
 		t.Fatalf("status = %d, body=%s", rr.Code, rr.Body.String())
 	}
 
-	var resp signrpc.SignResponse
+	var resp signrpc.TranscriptSignResponse
 	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
@@ -115,6 +123,39 @@ func TestSignHandler_Success(t *testing.T) {
 	}
 	if len(resp.Signature) == 0 {
 		t.Fatal("expected signature in response")
+	}
+}
+
+func TestSignHandler_RejectsLegacyDigestContract(t *testing.T) {
+	// Compatibility matrix: the /v1/sign wire contract is transcript-bound.
+	// The request below is a fully valid legacy digest-shaped request — a
+	// digest-schema server would sign it — so rejection here pins the
+	// intentional protocol break, not an incidental crypto error.
+	h := signHandler(&signer.Service{Store: staticStore{signer: mustRSAKey(t)}})
+
+	digest := sha256.Sum256([]byte("hello"))
+	body, err := json.Marshal(map[string]any{
+		"key_id":         "relay-cert",
+		"algorithm":      signrpc.AlgorithmRSAPKCS1v15SHA256,
+		"digest":         digest[:],
+		"timestamp_unix": time.Now().Unix(),
+		"nonce":          "abc",
+	})
+	if err != nil {
+		t.Fatalf("marshal legacy request: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, signrpc.SignPath, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected legacy digest request to be rejected with 400, got %d, body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "missing required handshake transcript field") {
+		t.Fatalf("expected transcript-contract rejection reason, got: %s", rr.Body.String())
 	}
 }
 
@@ -135,12 +176,16 @@ func TestSignHandler_MethodNotAllowed(t *testing.T) {
 
 func TestSignHandler_MapsServiceError(t *testing.T) {
 	h := signHandler(&signer.Service{Store: staticStore{err: io.EOF}})
-	body, err := json.Marshal(signrpc.SignRequest{
-		KeyID:         "relay-cert",
-		Algorithm:     signrpc.AlgorithmRSAPKCS1v15SHA256,
-		Digest:        []byte{1},
-		TimestampUnix: time.Now().Unix(),
-		Nonce:         "abc",
+	body, err := json.Marshal(signrpc.TranscriptSignRequest{
+		KeyID:               "relay-cert",
+		Algorithm:           signrpc.AlgorithmRSAPKCS1v15SHA256,
+		Binding:             []byte{0x01},
+		ClientHello:         []byte("client-hello"),
+		ServerHello:         []byte("server-hello"),
+		EncryptedExtensions: []byte("encrypted-extensions"),
+		Certificate:         []byte("certificate"),
+		TimestampUnix:       time.Now().Unix(),
+		Nonce:               "abc",
 	})
 	if err != nil {
 		t.Fatalf("marshal request: %v", err)

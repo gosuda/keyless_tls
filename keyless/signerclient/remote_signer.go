@@ -4,9 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto"
-	"crypto/ecdsa"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
@@ -14,7 +12,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -24,13 +21,12 @@ import (
 )
 
 type RemoteSigner struct {
-	keyID              string
-	publicKey          crypto.PublicKey
-	endpoint           string
-	transcriptEndpoint string
-	client             *http.Client
-	timeout            time.Duration
-	headers            func() http.Header
+	keyID     string
+	publicKey crypto.PublicKey
+	endpoint  string
+	client    *http.Client
+	timeout   time.Duration
+	headers   func() http.Header
 }
 
 func NewRemoteSigner(cfg RemoteSignerConfig, certPEM []byte) (*RemoteSigner, error) {
@@ -67,7 +63,6 @@ func NewRemoteSigner(cfg RemoteSignerConfig, certPEM []byte) (*RemoteSigner, err
 	if err != nil {
 		return nil, err
 	}
-	transcriptEndpoint := strings.TrimSuffix(endpoint, signrpc.SignPath) + signrpc.TranscriptSignPath
 	transport := &http.Transport{
 		TLSClientConfig:     tlsConf,
 		MaxIdleConns:        100,
@@ -77,13 +72,12 @@ func NewRemoteSigner(cfg RemoteSignerConfig, certPEM []byte) (*RemoteSigner, err
 	client := &http.Client{Transport: transport}
 
 	return &RemoteSigner{
-		keyID:              cfg.KeyID,
-		publicKey:          pub,
-		endpoint:           endpoint,
-		transcriptEndpoint: transcriptEndpoint,
-		client:             client,
-		timeout:            cfg.Timeout,
-		headers:            cfg.Headers,
+		keyID:     cfg.KeyID,
+		publicKey: pub,
+		endpoint:  endpoint,
+		client:    client,
+		timeout:   cfg.Timeout,
+		headers:   cfg.Headers,
 	}, nil
 }
 
@@ -130,75 +124,6 @@ func (s *RemoteSigner) Public() crypto.PublicKey {
 	return s.publicKey
 }
 
-func (s *RemoteSigner) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
-	if len(digest) == 0 {
-		return nil, errors.New("digest is empty")
-	}
-	if opts == nil {
-		return nil, errors.New("signer opts is required")
-	}
-
-	alg, err := algorithmFromSignerOpts(s.publicKey, opts)
-	if err != nil {
-		return nil, err
-	}
-
-	nonce, err := randomHex(16)
-	if err != nil {
-		return nil, err
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
-	defer cancel()
-
-	reqBody, err := json.Marshal(&signrpc.SignRequest{
-		KeyID:         s.keyID,
-		Algorithm:     alg,
-		Digest:        digest,
-		TimestampUnix: time.Now().Unix(),
-		Nonce:         nonce,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("encode sign request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.endpoint, bytes.NewReader(reqBody))
-	if err != nil {
-		return nil, fmt.Errorf("build sign request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	if s.headers != nil {
-		for key, values := range s.headers() {
-			req.Header.Del(key)
-			for _, value := range values {
-				req.Header.Add(key, value)
-			}
-		}
-	}
-
-	httpResp, err := s.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("remote sign request failed: %w", err)
-	}
-	defer httpResp.Body.Close()
-
-	if httpResp.StatusCode != http.StatusOK {
-		var errResp signrpc.ErrorResponse
-		if decodeErr := json.NewDecoder(httpResp.Body).Decode(&errResp); decodeErr == nil && errResp.Error != "" {
-			return nil, fmt.Errorf("remote sign request failed: %s", errResp.Error)
-		}
-		return nil, fmt.Errorf("remote sign request failed: http %d", httpResp.StatusCode)
-	}
-
-	var resp signrpc.SignResponse
-	if err := json.NewDecoder(httpResp.Body).Decode(&resp); err != nil {
-		return nil, fmt.Errorf("decode sign response: %w", err)
-	}
-
-	return resp.Signature, nil
-}
-
 func (s *RemoteSigner) SignTranscript(ctx context.Context, req *signrpc.TranscriptSignRequest) (*signrpc.TranscriptSignResponse, error) {
 	if req == nil {
 		return nil, errors.New("request is nil")
@@ -232,10 +157,9 @@ func (s *RemoteSigner) SignTranscript(ctx context.Context, req *signrpc.Transcri
 		return nil, fmt.Errorf("encode transcript sign request: %w", err)
 	}
 
-	url := s.transcriptEndpoint
-	if url == "" {
-		url = strings.TrimSuffix(s.endpoint, signrpc.SignPath) + signrpc.TranscriptSignPath
-	}
+	// signEndpoint already resolves to the single /v1/sign endpoint, whose
+	// wire contract is the transcript-bound one.
+	url := s.endpoint
 
 	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(reqBody))
 	if err != nil {
@@ -328,53 +252,6 @@ func parsePublicKeyFromCert(certPEM []byte) (crypto.PublicKey, error) {
 		return nil, fmt.Errorf("parse certificate: %w", err)
 	}
 	return parsed.PublicKey, nil
-}
-
-func algorithmFromSignerOpts(pub crypto.PublicKey, opts crypto.SignerOpts) (string, error) {
-	h := opts.HashFunc()
-	if h == 0 {
-		return "", errors.New("hash function must be set")
-	}
-
-	if _, ok := opts.(*rsa.PSSOptions); ok {
-		switch h {
-		case crypto.SHA256:
-			return signrpc.AlgorithmRSAPSSSHA256, nil
-		case crypto.SHA384:
-			return signrpc.AlgorithmRSAPSSSHA384, nil
-		case crypto.SHA512:
-			return signrpc.AlgorithmRSAPSSSHA512, nil
-		default:
-			return "", fmt.Errorf("unsupported RSA-PSS hash: %v", h)
-		}
-	}
-
-	switch pub.(type) {
-	case *rsa.PublicKey:
-		switch h {
-		case crypto.SHA256:
-			return signrpc.AlgorithmRSAPKCS1v15SHA256, nil
-		case crypto.SHA384:
-			return signrpc.AlgorithmRSAPKCS1v15SHA384, nil
-		case crypto.SHA512:
-			return signrpc.AlgorithmRSAPKCS1v15SHA512, nil
-		default:
-			return "", fmt.Errorf("unsupported RSA hash: %v", h)
-		}
-	case *ecdsa.PublicKey:
-		switch h {
-		case crypto.SHA256:
-			return signrpc.AlgorithmECDSASHA256, nil
-		case crypto.SHA384:
-			return signrpc.AlgorithmECDSASHA384, nil
-		case crypto.SHA512:
-			return signrpc.AlgorithmECDSASHA512, nil
-		default:
-			return "", fmt.Errorf("unsupported ECDSA hash: %v", h)
-		}
-	default:
-		return "", fmt.Errorf("unsupported public key type: %T", pub)
-	}
 }
 
 func randomHex(size int) (string, error) {

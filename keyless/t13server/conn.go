@@ -7,6 +7,8 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -24,7 +26,11 @@ type Conn struct {
 	server           *Server
 	handshakeTimeout time.Duration
 
-	state ConnectionState
+	deadlineMu    sync.Mutex
+	readDeadline  time.Time
+	writeDeadline time.Time
+
+	state tls.ConnectionState
 
 	inCipher  *recordCipher
 	outCipher *recordCipher
@@ -80,18 +86,56 @@ func (c *Conn) ensureHandshake() error {
 	return c.handshakeErr
 }
 
+func earliestDeadline(d1, d2 time.Time) time.Time {
+	if d1.IsZero() {
+		return d2
+	}
+	if d2.IsZero() {
+		return d1
+	}
+	if d1.Before(d2) {
+		return d1
+	}
+	return d2
+}
+
 func (c *Conn) doHandshake(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = c.raw.SetDeadline(deadline)
-	} else if c.handshakeTimeout > 0 {
-		_ = c.raw.SetDeadline(time.Now().Add(c.handshakeTimeout))
+	// Compute effective handshake deadline as the earliest applicable limit among:
+	// 1) c.handshakeTimeout (configured maximum duration)
+	// 2) ctx.Deadline() (caller context deadline)
+	// 3) caller-set read / write connection deadlines
+	var handshakeLimit time.Time
+	if c.handshakeTimeout > 0 {
+		handshakeLimit = time.Now().Add(c.handshakeTimeout)
 	}
+	if ctxDeadline, ok := ctx.Deadline(); ok {
+		handshakeLimit = earliestDeadline(handshakeLimit, ctxDeadline)
+	}
+
+	c.deadlineMu.Lock()
+	callerReadDeadline := c.readDeadline
+	callerWriteDeadline := c.writeDeadline
+	c.deadlineMu.Unlock()
+
+	effectiveReadDeadline := earliestDeadline(handshakeLimit, callerReadDeadline)
+	effectiveWriteDeadline := earliestDeadline(handshakeLimit, callerWriteDeadline)
+
+	_ = c.raw.SetReadDeadline(effectiveReadDeadline)
+	_ = c.raw.SetWriteDeadline(effectiveWriteDeadline)
+
+	// Restore caller-owned deadlines upon exiting handshake
 	defer func() {
-		_ = c.raw.SetDeadline(time.Time{})
+		c.deadlineMu.Lock()
+		rDeadline := c.readDeadline
+		wDeadline := c.writeDeadline
+		c.deadlineMu.Unlock()
+
+		_ = c.raw.SetReadDeadline(rDeadline)
+		_ = c.raw.SetWriteDeadline(wDeadline)
 	}()
 
 	if ctx.Done() != nil {
@@ -117,6 +161,10 @@ func (c *Conn) doHandshake(ctx context.Context) error {
 }
 
 func (c *Conn) Read(b []byte) (int, error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
+
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 
@@ -130,6 +178,9 @@ func (c *Conn) Read(b []byte) (int, error) {
 			return 0, err
 		}
 		if innerType == recordTypeApplicationData {
+			if len(payload) == 0 {
+				continue // Skip zero-length application data records (RFC 8446 Section 5.4)
+			}
 			c.readBuf = payload
 			break
 		}
@@ -193,11 +244,30 @@ func (c *Conn) Close() error {
 	return c.raw.Close()
 }
 
-func (c *Conn) LocalAddr() net.Addr                { return c.raw.LocalAddr() }
-func (c *Conn) RemoteAddr() net.Addr               { return c.raw.RemoteAddr() }
-func (c *Conn) SetDeadline(t time.Time) error      { return c.raw.SetDeadline(t) }
-func (c *Conn) SetReadDeadline(t time.Time) error  { return c.raw.SetReadDeadline(t) }
-func (c *Conn) SetWriteDeadline(t time.Time) error { return c.raw.SetWriteDeadline(t) }
+func (c *Conn) LocalAddr() net.Addr  { return c.raw.LocalAddr() }
+func (c *Conn) RemoteAddr() net.Addr { return c.raw.RemoteAddr() }
+
+func (c *Conn) SetDeadline(t time.Time) error {
+	c.deadlineMu.Lock()
+	c.readDeadline = t
+	c.writeDeadline = t
+	c.deadlineMu.Unlock()
+	return c.raw.SetDeadline(t)
+}
+
+func (c *Conn) SetReadDeadline(t time.Time) error {
+	c.deadlineMu.Lock()
+	c.readDeadline = t
+	c.deadlineMu.Unlock()
+	return c.raw.SetReadDeadline(t)
+}
+
+func (c *Conn) SetWriteDeadline(t time.Time) error {
+	c.deadlineMu.Lock()
+	c.writeDeadline = t
+	c.deadlineMu.Unlock()
+	return c.raw.SetWriteDeadline(t)
+}
 
 func (c *Conn) handshake(ctx context.Context, s *Server) error {
 	// 1. Read ClientHello (accumulated across record boundaries)
@@ -430,10 +500,14 @@ func (c *Conn) handshake(ctx context.Context, s *Server) error {
 		return err
 	}
 
-	c.state = ConnectionState{
+	c.state = tls.ConnectionState{
+		Version:            tls.VersionTLS13,
+		HandshakeComplete:  true,
 		ServerName:         ch.serverName,
 		NegotiatedProtocol: negotiatedALPN,
 		CipherSuite:        0x1301,
+		PeerCertificates:   s.parsedChain,
+		VerifiedChains:     [][]*x509.Certificate{s.parsedChain},
 	}
 	c.handshakeComplete = true
 

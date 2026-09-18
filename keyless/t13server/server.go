@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -20,11 +21,7 @@ type TranscriptSigner interface {
 	SignTranscript(ctx context.Context, req *signrpc.TranscriptSignRequest) (*signrpc.TranscriptSignResponse, error)
 }
 
-type ConnectionState struct {
-	ServerName         string
-	NegotiatedProtocol string
-	CipherSuite        uint16
-}
+type ConnectionState = tls.ConnectionState
 
 type Config struct {
 	// Certificates is the raw DER certificate chain. The first is the leaf.

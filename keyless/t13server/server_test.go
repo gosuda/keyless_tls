@@ -195,6 +195,9 @@ func TestTLS13Server_HTTPSInterop(t *testing.T) {
 
 	httpServer := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.TLS != nil && r.TLS.ServerName != "localhost" {
+				t.Errorf("unexpected ServerName in r.TLS: %q", r.TLS.ServerName)
+			}
 			w.Header().Set("Content-Type", "text/plain")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("HTTPS GET success!"))
@@ -1222,6 +1225,191 @@ func TestTLS13Server_DefaultALPNIsHTTP11(t *testing.T) {
 	}
 	if serverConn.ConnectionState().NegotiatedProtocol != "http/1.1" {
 		t.Fatalf("expected server negotiated protocol http/1.1, got %q", serverConn.ConnectionState().NegotiatedProtocol)
+	}
+}
+
+func TestTLS13Server_CallerDeadlineShorterThanHandshakeTimeout(t *testing.T) {
+	certPEM, keyPEM, err := testutil.GenerateCert("example.com", false)
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+	priv, err := parseECDSAPrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("parse key: %v", err)
+	}
+	signerSvc := &signer.Service{
+		Store:                         &mockCryptoSignerStore{priv: priv},
+		AllowUnboundTranscriptSigning: true,
+	}
+	srv, err := t13server.NewServer(t13server.Config{
+		CertPEM:          certPEM,
+		KeyID:            "test-key",
+		TranscriptSigner: signerSvc,
+		HandshakeTimeout: 5 * time.Second, // Long server timeout
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer rawLis.Close()
+
+	// Client dials but stalls
+	clientConn, err := net.Dial("tcp", rawLis.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer clientConn.Close()
+
+	serverRaw, err := rawLis.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	defer serverRaw.Close()
+
+	conn := srv.NewConn(serverRaw, nil)
+	// Caller sets a short 100ms read deadline before calling Read (which triggers lazy handshake)
+	shortDeadline := 100 * time.Millisecond
+	_ = conn.SetReadDeadline(time.Now().Add(shortDeadline))
+
+	start := time.Now()
+	buf := make([]byte, 64)
+	_, readErr := conn.Read(buf)
+	elapsed := time.Since(start)
+
+	if readErr == nil {
+		t.Fatal("expected read timeout error, got nil")
+	}
+	// Handshake must time out according to the caller's short deadline (~100ms), NOT 5 seconds
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("caller deadline was ignored; took %v to time out (expected ~100ms)", elapsed)
+	}
+}
+
+func TestTLS13Server_HandshakeTimeoutWinsOverLaterContextDeadline(t *testing.T) {
+	certPEM, keyPEM, err := testutil.GenerateCert("example.com", false)
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+	priv, err := parseECDSAPrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("parse key: %v", err)
+	}
+	signerSvc := &signer.Service{
+		Store:                         &mockCryptoSignerStore{priv: priv},
+		AllowUnboundTranscriptSigning: true,
+	}
+	srv, err := t13server.NewServer(t13server.Config{
+		CertPEM:          certPEM,
+		KeyID:            "test-key",
+		TranscriptSigner: signerSvc,
+		HandshakeTimeout: 100 * time.Millisecond, // Short server timeout
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer rawLis.Close()
+
+	// Client stalls
+	clientConn, err := net.Dial("tcp", rawLis.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer clientConn.Close()
+
+	serverRaw, err := rawLis.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	defer serverRaw.Close()
+
+	conn := srv.NewConn(serverRaw, nil)
+	// Caller passes context with a much longer deadline (5 seconds)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	hsErr := conn.HandshakeContext(ctx)
+	elapsed := time.Since(start)
+
+	if hsErr == nil {
+		t.Fatal("expected handshake error due to HandshakeTimeout, got nil")
+	}
+	// HandshakeTimeout must win over the later context deadline!
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("HandshakeTimeout was not enforced; took %v (expected ~100ms)", elapsed)
+	}
+}
+
+func TestTLS13Server_CallerDeadlinePreservedAfterHandshake(t *testing.T) {
+	certPEM, keyPEM, err := testutil.GenerateCert("example.com", false)
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+	priv, err := parseECDSAPrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("parse key: %v", err)
+	}
+	signerSvc := &signer.Service{
+		Store:                         &mockCryptoSignerStore{priv: priv},
+		AllowUnboundTranscriptSigning: true,
+	}
+	srv, err := t13server.NewServer(t13server.Config{
+		CertPEM:          certPEM,
+		KeyID:            "test-key",
+		TranscriptSigner: signerSvc,
+		HandshakeTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	clientRaw, serverRaw := net.Pipe()
+	defer clientRaw.Close()
+	defer serverRaw.Close()
+
+	rootPool := x509.NewCertPool()
+	rootPool.AppendCertsFromPEM(certPEM)
+	client := tls.Client(clientRaw, &tls.Config{
+		ServerName: "example.com",
+		RootCAs:    rootPool,
+		MinVersion: tls.VersionTLS13,
+	})
+
+	serverConn := srv.NewConn(serverRaw, nil)
+	// Caller sets a deadline of +10 seconds before handshake
+	expectedDeadline := time.Now().Add(10 * time.Second)
+	_ = serverConn.SetReadDeadline(expectedDeadline)
+
+	hsErrCh := make(chan error, 2)
+	go func() {
+		hsErrCh <- client.Handshake()
+	}()
+	go func() {
+		hsErrCh <- serverConn.HandshakeContext(context.Background())
+	}()
+
+	for i := 0; i < 2; i++ {
+		if err := <-hsErrCh; err != nil {
+			t.Fatalf("handshake failed: %v", err)
+		}
+	}
+
+	// Verify standard ConnectionState fields
+	cs := serverConn.ConnectionState()
+	if !cs.HandshakeComplete {
+		t.Fatal("expected HandshakeComplete to be true")
+	}
+	if cs.Version != tls.VersionTLS13 {
+		t.Fatalf("expected TLS 1.3, got %x", cs.Version)
 	}
 }
 

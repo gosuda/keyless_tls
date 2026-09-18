@@ -86,3 +86,51 @@ func TestConn_UnsupportedInnerTypeRejected(t *testing.T) {
 		t.Fatalf("unexpected error message: %v", err)
 	}
 }
+
+func TestConn_ZeroLengthApplicationDataRecordSkipped(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	key := make([]byte, 16)
+	iv := make([]byte, 12)
+	inCipher, err := newRecordCipher(key, iv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outCipher, err := newRecordCipher(key, iv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn := &Conn{
+		raw:               c1,
+		inCipher:          inCipher,
+		outCipher:         outCipher,
+		handshakeComplete: true,
+	}
+	conn.handshakeOnce.Do(func() {})
+
+	// Peer sends:
+	// 1. Zero-length application data record
+	// 2. Real application data record with payload "hello world"
+	go func() {
+		emptyRec, _ := outCipher.encryptRecord(recordTypeApplicationData, []byte{})
+		_, _ = c2.Write(emptyRec)
+
+		dataRec, _ := outCipher.encryptRecord(recordTypeApplicationData, []byte("hello world"))
+		_, _ = c2.Write(dataRec)
+	}()
+
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("Read returned error: %v", err)
+	}
+	if n == 0 {
+		t.Fatal("Read returned (0, nil) instead of consuming zero-length record and reading next record")
+	}
+	if string(buf[:n]) != "hello world" {
+		t.Fatalf("unexpected payload: %q", string(buf[:n]))
+	}
+}

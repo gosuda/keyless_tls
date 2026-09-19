@@ -302,15 +302,15 @@ go run ./cmd/relay-signer \
   -tls-cert certs/relay-server.crt \
   -tls-key certs/relay-server.key \
   -client-ca certs/client-ca.crt \
-  -sign-key certs/relay-signing.key \
-  -allow-unbound-transcript-signing
+  -sign-key certs/relay-signing.key
 ```
 
-`/v1/sign` is fail-closed by default: the signer refuses every request unless a
-`TranscriptValidator` is configured. `-allow-unbound-transcript-signing` is a
-demo-mode opt-in that skips binding validation so the quick start can complete
-handshakes; production deployments must instead deploy a validator that
-authorizes the request's `binding` (and transcript) field.
+`relay-signer` warns at startup when no `TranscriptValidator` is configured: the
+library then signs every structurally valid request, which is the generic
+primitive. Deciding what a request's `binding` must contain — lease, stream,
+hostname, anything — is deployment policy, so production deployments run a
+signer with a validator that authorizes the `binding` (and transcript) field
+before a CertificateVerify signature is produced.
 
 2) Run tunnel app
 
@@ -415,8 +415,7 @@ go run ./cmd/relay-signer \
   -tls-cert certs/relay-server.crt \
   -tls-key certs/relay-server.key \
   -client-ca certs/client-ca.crt \
-  -sign-key certs/relay-signing.key \
-  -allow-unbound-transcript-signing
+  -sign-key certs/relay-signing.key
 
 go run ./examples/tunnel-http \
   -listen :8443 \
@@ -430,6 +429,26 @@ go run ./examples/tunnel-http \
 ```
 
 ---
+
+## Ownership
+
+`keyless_tls` owns the mechanism, and only the mechanism:
+
+- the signer receives the transcript of the actual TLS connection it terminates;
+- TLS 1.3 transcript, hash, and key-schedule correctness;
+- record and handshake-message framing, fragmentation, timeouts, cancellation;
+- TLS 1.3 exporter derivation (`Conn.ExportKeyingMaterial`);
+- generic transport and opaque binding plumbing (the binding is bytes the library never interprets).
+
+Consumers own the policy:
+
+- whether a binding is mandatory and what it means (relay stream, lease, hostname, tenant);
+- whether unvalidated transcript signing is forbidden (configure a `TranscriptValidator` to enforce it);
+- which ALPN/profile to expose, whether the signer deployment requires mTLS, and which
+  key/algorithm combinations are permitted.
+
+A generic arbitrary-digest signing endpoint is deliberately absent: transcript binding is the
+library's core guarantee, not one deployment's hardening choice.
 
 ## Security and operations notes
 

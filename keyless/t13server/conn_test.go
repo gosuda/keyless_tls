@@ -24,10 +24,11 @@ func TestConn_PostHandshakeHandshakeMessageRejected(t *testing.T) {
 	}
 
 	conn := &Conn{
-		raw:               c1,
-		inCipher:          inCipher,
-		outCipher:         outCipher,
-		handshakeComplete: true,
+		raw: c1,
+		sess: &session{
+			inCipher:  inCipher,
+			outCipher: outCipher,
+		},
 	}
 	conn.handshakeOnce.Do(func() {}) // mark handshake done
 
@@ -66,10 +67,11 @@ func TestConn_UnsupportedInnerTypeRejected(t *testing.T) {
 	}
 
 	conn := &Conn{
-		raw:               c1,
-		inCipher:          inCipher,
-		outCipher:         outCipher,
-		handshakeComplete: true,
+		raw: c1,
+		sess: &session{
+			inCipher:  inCipher,
+			outCipher: outCipher,
+		},
 	}
 	conn.handshakeOnce.Do(func() {})
 
@@ -105,10 +107,11 @@ func TestConn_ZeroLengthApplicationDataRecordSkipped(t *testing.T) {
 	}
 
 	conn := &Conn{
-		raw:               c1,
-		inCipher:          inCipher,
-		outCipher:         outCipher,
-		handshakeComplete: true,
+		raw: c1,
+		sess: &session{
+			inCipher:  inCipher,
+			outCipher: outCipher,
+		},
 	}
 	conn.handshakeOnce.Do(func() {})
 

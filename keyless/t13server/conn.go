@@ -29,33 +29,40 @@ type Conn struct {
 	readDeadline  time.Time
 	writeDeadline time.Time
 
-	state tls.ConnectionState
-
-	// stateMu guards the connection-visible handshake state below: state,
-	// handshakeComplete, inCipher and outCipher. Writers (the handshake) must
-	// publish under it; Close() and ConnectionState() must read under it, so
-	// concurrent callers always see a consistent snapshot. The Read/Write hot
-	// paths are ordered by handshakeOnce instead (every caller passes through
-	// handshakeOnce.Do before touching the ciphers).
+	// sess is the single published handshake result. The handshake builds it
+	// off to the side and publishes it once under stateMu; concurrent
+	// ConnectionState/Close/ExportKeyingMaterial readers then observe the
+	// completed handshake as one consistent value instead of many
+	// independently published fields. A nil sess means the handshake has not
+	// completed (or failed).
 	stateMu sync.Mutex
-
-	inCipher  *recordCipher
-	outCipher *recordCipher
-
-	// exporterSecret is the TLS 1.3 exporter master secret derived during
-	// the handshake (RFC 8446 Section 7.5). It is set under stateMu at the
-	// same publish point as handshakeComplete and stays nil until then, so
-	// ExportKeyingMaterial fails cleanly before a successful handshake.
-	exporterSecret []byte
+	sess    *session
 
 	readMu  sync.Mutex
 	readBuf []byte
 
 	writeMu sync.Mutex
 
-	handshakeOnce     sync.Once
-	handshakeErr      error
-	handshakeComplete bool
+	handshakeOnce sync.Once
+	handshakeErr  error
+}
+
+// session is the completed-handshake result: the two traffic ciphers, the
+// public connection state, and the exporter master secret. It is built
+// entirely by the handshake and immutable after publication.
+type session struct {
+	inCipher       *recordCipher
+	outCipher      *recordCipher
+	state          tls.ConnectionState
+	exporterSecret []byte
+}
+
+// loadSession returns the published session under the state lock, or nil
+// before a successful handshake.
+func (c *Conn) loadSession() *session {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	return c.sess
 }
 
 func newConn(raw net.Conn, binding []byte, s *Server, timeout time.Duration) *Conn {
@@ -76,9 +83,10 @@ func (c *Conn) Binding() []byte {
 }
 
 func (c *Conn) ConnectionState() ConnectionState {
-	c.stateMu.Lock()
-	defer c.stateMu.Unlock()
-	return c.state
+	if sess := c.loadSession(); sess != nil {
+		return sess.state
+	}
+	return ConnectionState{}
 }
 
 // Exporter inputs are caller-controlled, and both cross an encoding limit:
@@ -100,8 +108,9 @@ const (
 // handshake; concurrent calls are safe.
 func (c *Conn) ExportKeyingMaterial(label string, context []byte, length int) ([]byte, error) {
 	c.stateMu.Lock()
-	defer c.stateMu.Unlock()
-	if !c.handshakeComplete || len(c.exporterSecret) == 0 {
+	sess := c.sess
+	c.stateMu.Unlock()
+	if sess == nil || len(sess.exporterSecret) == 0 {
 		return nil, errors.New("tls: keying material is unavailable before a successful handshake")
 	}
 	if length < 0 {
@@ -117,7 +126,7 @@ func (c *Conn) ExportKeyingMaterial(label string, context []byte, length int) ([
 	// 32-byte value, not an empty context field — and feeds the application
 	// context only into the second expand, matching crypto/tls.
 	emptyTranscript := sha256.Sum256(nil)
-	derived := deriveSecret(c.exporterSecret, label, emptyTranscript[:])
+	derived := deriveSecret(sess.exporterSecret, label, emptyTranscript[:])
 	contextHash := sha256.Sum256(context)
 	return hkdfExpandLabel(derived, "exporter", contextHash[:], length), nil
 }
@@ -245,7 +254,7 @@ func (c *Conn) Read(b []byte) (int, error) {
 	}
 
 	for len(c.readBuf) == 0 {
-		innerType, payload, err := c.inCipher.decryptRecord(c.raw)
+		innerType, payload, err := c.sess.inCipher.decryptRecord(c.raw)
 		if err != nil {
 			return 0, err
 		}
@@ -288,7 +297,7 @@ func (c *Conn) Write(b []byte) (int, error) {
 		chunk := b[:chunkSize]
 		b = b[chunkSize:]
 
-		rec, err := c.outCipher.encryptRecord(recordTypeApplicationData, chunk)
+		rec, err := c.sess.outCipher.encryptRecord(recordTypeApplicationData, chunk)
 		if err != nil {
 			return total, err
 		}
@@ -304,14 +313,13 @@ func (c *Conn) Close() error {
 	// Attempt sending encrypted close_notify alert if handshake was complete.
 	// Best-effort: use TryLock so Close() is never blocked by a concurrent Write().
 	c.stateMu.Lock()
-	complete := c.handshakeComplete
-	outCipher := c.outCipher
+	sess := c.sess
 	c.stateMu.Unlock()
 
-	if complete && outCipher != nil {
+	if sess != nil && sess.outCipher != nil {
 		if c.writeMu.TryLock() {
 			closeNotifyAlert := []byte{0x01, 0x00} // warning, close_notify
-			if rec, err := outCipher.encryptRecord(recordTypeAlert, closeNotifyAlert); err == nil {
+			if rec, err := sess.outCipher.encryptRecord(recordTypeAlert, closeNotifyAlert); err == nil {
 				_ = c.raw.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
 				_, _ = c.raw.Write(rec)
 			}
@@ -636,14 +644,16 @@ func (c *Conn) handshake(ctx context.Context, s *Server) error {
 		LocalCertificate:           s.cfg.Certificates,
 	}
 
-	// Publish all connection-visible handshake state together so concurrent
-	// Close() / ConnectionState() readers observe a consistent snapshot.
+	// Publish the completed handshake as one session so concurrent
+	// Close()/ConnectionState()/ExportKeyingMaterial readers observe a
+	// consistent snapshot.
 	c.stateMu.Lock()
-	c.inCipher = clientAppCipher
-	c.outCipher = serverAppCipher
-	c.state = state
-	c.exporterSecret = exporterSecret
-	c.handshakeComplete = true
+	c.sess = &session{
+		inCipher:       clientAppCipher,
+		outCipher:      serverAppCipher,
+		state:          state,
+		exporterSecret: exporterSecret,
+	}
 	c.stateMu.Unlock()
 
 	return nil

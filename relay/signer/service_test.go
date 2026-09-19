@@ -159,14 +159,16 @@ func TestSignTranscript_ValidationErrors(t *testing.T) {
 	}
 }
 
-func TestSignTranscript_FailClosedWithoutValidator(t *testing.T) {
+func TestSignTranscript_SignsWithoutValidator(t *testing.T) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
 	}
 	store := &staticStore{keyID: "test-key", signer: priv}
 
-	// Without validator and without AllowUnboundTranscriptSigning: MUST FAIL
+	// A nil validator is the library primitive: structurally valid requests
+	// are signed. Enforcing binding semantics is the deployer's policy, so
+	// policy-carrying deployments configure a TranscriptValidator.
 	svc := &signer.Service{Store: store}
 	req := &signrpc.TranscriptSignRequest{
 		KeyID:               "test-key",
@@ -179,16 +181,9 @@ func TestSignTranscript_FailClosedWithoutValidator(t *testing.T) {
 		TimestampUnix:       time.Now().Unix(),
 		Nonce:               "nonce",
 	}
-	_, err = svc.SignTranscript(context.Background(), req)
-	if !errors.Is(err, signer.ErrPermissionDenied) {
-		t.Fatalf("expected ErrPermissionDenied when validator is omitted, got %v", err)
-	}
-
-	// With AllowUnboundTranscriptSigning: true: SUCCESS
-	svc.AllowUnboundTranscriptSigning = true
 	resp, err := svc.SignTranscript(context.Background(), req)
 	if err != nil {
-		t.Fatalf("expected success with AllowUnboundTranscriptSigning, got %v", err)
+		t.Fatalf("expected success without validator, got %v", err)
 	}
 	if len(resp.Signature) == 0 {
 		t.Fatal("empty signature")

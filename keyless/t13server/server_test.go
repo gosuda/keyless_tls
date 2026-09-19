@@ -168,8 +168,7 @@ func TestTLS13Server_HTTPSInterop(t *testing.T) {
 	}
 
 	signerSvc := &signer.Service{
-		Store:                         &mockCryptoSignerStore{priv: priv},
-		AllowUnboundTranscriptSigning: true,
+		Store: &mockCryptoSignerStore{priv: priv},
 	}
 
 	srv, err := t13server.NewServer(t13server.Config{
@@ -337,8 +336,7 @@ func TestTLS13Server_NegativeTLS12Client(t *testing.T) {
 	}
 
 	signerSvc := &signer.Service{
-		Store:                         &mockCryptoSignerStore{priv: priv},
-		AllowUnboundTranscriptSigning: true,
+		Store: &mockCryptoSignerStore{priv: priv},
 	}
 
 	srv, err := t13server.NewServer(t13server.Config{
@@ -395,8 +393,7 @@ func TestTLS13Server_NegativeMissing0x1301InClientHello(t *testing.T) {
 	}
 
 	signerSvc := &signer.Service{
-		Store:                         &mockCryptoSignerStore{priv: priv},
-		AllowUnboundTranscriptSigning: true,
+		Store: &mockCryptoSignerStore{priv: priv},
 	}
 
 	srv, err := t13server.NewServer(t13server.Config{
@@ -447,8 +444,7 @@ func TestTLS13Server_LargePayloadMultiRecord(t *testing.T) {
 	}
 
 	signerSvc := &signer.Service{
-		Store:                         &mockCryptoSignerStore{priv: priv},
-		AllowUnboundTranscriptSigning: true,
+		Store: &mockCryptoSignerStore{priv: priv},
 	}
 
 	srv, err := t13server.NewServer(t13server.Config{
@@ -715,8 +711,7 @@ func TestTLS13Server_AcceptDoesNotBlockOnStalledClient(t *testing.T) {
 	}
 
 	signerSvc := &signer.Service{
-		Store:                         &mockCryptoSignerStore{priv: priv},
-		AllowUnboundTranscriptSigning: true,
+		Store: &mockCryptoSignerStore{priv: priv},
 	}
 
 	srv, err := t13server.NewServer(t13server.Config{
@@ -826,8 +821,7 @@ func TestTLS13Server_HandshakeContextCancellation(t *testing.T) {
 		t.Fatalf("parse key: %v", err)
 	}
 	signerSvc := &signer.Service{
-		Store:                         &mockCryptoSignerStore{priv: priv},
-		AllowUnboundTranscriptSigning: true,
+		Store: &mockCryptoSignerStore{priv: priv},
 	}
 	srv, err := t13server.NewServer(t13server.Config{
 		CertPEM:          certPEM,
@@ -892,8 +886,7 @@ func TestTLS13Server_ListenerBindingProviderErrorContinues(t *testing.T) {
 		t.Fatalf("parse key: %v", err)
 	}
 	signerSvc := &signer.Service{
-		Store:                         &mockCryptoSignerStore{priv: priv},
-		AllowUnboundTranscriptSigning: true,
+		Store: &mockCryptoSignerStore{priv: priv},
 	}
 	srv, err := t13server.NewServer(t13server.Config{
 		CertPEM:          certPEM,
@@ -991,8 +984,7 @@ func TestTLS13Server_CloseUnblocksWrite(t *testing.T) {
 		t.Fatalf("parse key: %v", err)
 	}
 	signerSvc := &signer.Service{
-		Store:                         &mockCryptoSignerStore{priv: priv},
-		AllowUnboundTranscriptSigning: true,
+		Store: &mockCryptoSignerStore{priv: priv},
 	}
 	srv, err := t13server.NewServer(t13server.Config{
 		CertPEM:          certPEM,
@@ -1105,8 +1097,7 @@ func TestTLS13Server_FragmentedClientHello(t *testing.T) {
 		t.Fatalf("parse key: %v", err)
 	}
 	signerSvc := &signer.Service{
-		Store:                         &mockCryptoSignerStore{priv: priv},
-		AllowUnboundTranscriptSigning: true,
+		Store: &mockCryptoSignerStore{priv: priv},
 	}
 	srv, err := t13server.NewServer(t13server.Config{
 		CertPEM:          certPEM,
@@ -1181,8 +1172,7 @@ func TestTLS13Server_DefaultALPNIsHTTP11(t *testing.T) {
 		t.Fatalf("parse key: %v", err)
 	}
 	signerSvc := &signer.Service{
-		Store:                         &mockCryptoSignerStore{priv: priv},
-		AllowUnboundTranscriptSigning: true,
+		Store: &mockCryptoSignerStore{priv: priv},
 	}
 	srv, err := t13server.NewServer(t13server.Config{
 		CertPEM:          certPEM,
@@ -1240,8 +1230,7 @@ func TestTLS13Server_CallerDeadlineShorterThanHandshakeTimeout(t *testing.T) {
 		t.Fatalf("parse key: %v", err)
 	}
 	signerSvc := &signer.Service{
-		Store:                         &mockCryptoSignerStore{priv: priv},
-		AllowUnboundTranscriptSigning: true,
+		Store: &mockCryptoSignerStore{priv: priv},
 	}
 	srv, err := t13server.NewServer(t13server.Config{
 		CertPEM:          certPEM,
@@ -1301,8 +1290,7 @@ func TestTLS13Server_HandshakeTimeoutWinsOverLaterContextDeadline(t *testing.T) 
 		t.Fatalf("parse key: %v", err)
 	}
 	signerSvc := &signer.Service{
-		Store:                         &mockCryptoSignerStore{priv: priv},
-		AllowUnboundTranscriptSigning: true,
+		Store: &mockCryptoSignerStore{priv: priv},
 	}
 	srv, err := t13server.NewServer(t13server.Config{
 		CertPEM:          certPEM,
@@ -1361,8 +1349,7 @@ func TestTLS13Server_CallerDeadlinePreservedAfterHandshake(t *testing.T) {
 		t.Fatalf("parse key: %v", err)
 	}
 	signerSvc := &signer.Service{
-		Store:                         &mockCryptoSignerStore{priv: priv},
-		AllowUnboundTranscriptSigning: true,
+		Store: &mockCryptoSignerStore{priv: priv},
 	}
 	srv, err := t13server.NewServer(t13server.Config{
 		CertPEM:          certPEM,
@@ -1635,8 +1622,7 @@ func TestTLS13Server_ConnectionStateServerSemantics(t *testing.T) {
 		t.Fatalf("parse key: %v", err)
 	}
 	signerSvc := &signer.Service{
-		Store:                         &mockCryptoSignerStore{priv: priv},
-		AllowUnboundTranscriptSigning: true,
+		Store: &mockCryptoSignerStore{priv: priv},
 	}
 	srv, err := t13server.NewServer(t13server.Config{
 		CertPEM:          certPEM,
@@ -1739,8 +1725,7 @@ func TestConn_ConnectionStateAndCloseConcurrentWithHandshakeCompletion(t *testin
 		t.Fatalf("parse key: %v", err)
 	}
 	inner := &signer.Service{
-		Store:                         &mockCryptoSignerStore{priv: priv},
-		AllowUnboundTranscriptSigning: true,
+		Store: &mockCryptoSignerStore{priv: priv},
 	}
 
 	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -1857,8 +1842,7 @@ func TestTLS13Server_LargeCertificateChainFragmentation(t *testing.T) {
 		t.Fatalf("parse key: %v", err)
 	}
 	signerSvc := &signer.Service{
-		Store:                         &mockCryptoSignerStore{priv: priv},
-		AllowUnboundTranscriptSigning: true,
+		Store: &mockCryptoSignerStore{priv: priv},
 	}
 	srv, err := t13server.NewServer(t13server.Config{
 		CertPEM:          chainPEM,
@@ -1940,8 +1924,7 @@ func TestTLS13Server_SignerResponseValidation(t *testing.T) {
 		t.Fatalf("parse key: %v", err)
 	}
 	realSigner := &signer.Service{
-		Store:                         &mockCryptoSignerStore{priv: priv},
-		AllowUnboundTranscriptSigning: true,
+		Store: &mockCryptoSignerStore{priv: priv},
 	}
 
 	tests := []struct {

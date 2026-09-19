@@ -83,9 +83,8 @@ func TestSignHandler_Success(t *testing.T) {
 		Store:       staticStore{signer: priv},
 		AllowedSkew: 30 * time.Second,
 		// The handler-level test exercises the signing path without a
-		// transcript validator; validator enforcement is covered in
-		// relay/signer tests.
-		AllowUnboundTranscriptSigning: true,
+		// transcript validator, which is the library primitive; validator
+		// rejection is covered in relay/signer tests.
 	}
 	h := signHandler(service)
 

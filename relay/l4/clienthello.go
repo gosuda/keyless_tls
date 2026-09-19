@@ -18,6 +18,15 @@ const (
 	extALPN                  = 16
 	extEncryptedClientHello  = 0xfe0d
 	defaultInspectTimeout    = 2 * time.Second
+	// maxTLSRecordBody bounds a single TLS record payload. RFC 8446 caps
+	// plaintext records at 2^14 bytes; the slack absorbs CBC padding from
+	// older stacks and keeps a lying record header from driving allocations.
+	maxTLSRecordBody = 16384 + 2048
+	// maxClientHelloMessage bounds the reassembled ClientHello handshake
+	// message. Real hellos stay far below 64 KiB, but the 3-byte message
+	// length prefix permits 16 MiB claims, so the cap stops a hostile peer
+	// from streaming records until memory dies.
+	maxClientHelloMessage = 1 << 17
 )
 
 var (
@@ -32,8 +41,13 @@ type ClientHelloInfo struct {
 	// encrypted_client_hello extension. In that case ServerName is the outer
 	// public name, not the encrypted inner SNI.
 	ECHOffered bool
-	ClientAddr net.Addr
-	LocalAddr  net.Addr
+	// HandshakeMessage is the exact wire bytes of the complete ClientHello
+	// handshake message, including the 4-byte message header, reassembled
+	// from one or more TLS records. It is populated once a structurally
+	// complete hello has been read, even when deeper parsing then fails.
+	HandshakeMessage []byte
+	ClientAddr       net.Addr
+	LocalAddr        net.Addr
 }
 
 func InspectClientHello(conn net.Conn, timeout time.Duration) (ClientHelloInfo, net.Conn, error) {
@@ -49,30 +63,83 @@ func InspectClientHello(conn net.Conn, timeout time.Duration) (ClientHelloInfo, 
 		_ = conn.SetReadDeadline(time.Time{})
 	}()
 
+	// A ClientHello handshake message may span multiple TLS records, so
+	// handshake-type records are accumulated until the message length
+	// prefix is satisfied. Every consumed byte is replayed to the caller
+	// unchanged so downstream routing and proxying see identical wire data.
 	captured := make([]byte, 0, 1024)
+	handshake := make([]byte, 0, 1024)
 
 	header := make([]byte, tlsRecordHeaderLen)
-	if err := readFullCapture(conn, header, &captured); err != nil {
-		return helloWithAddrs(conn), prependConn(conn, captured), fmt.Errorf("read TLS record header: %w", err)
-	}
-	if header[0] != tlsContentTypeHandshake {
-		return helloWithAddrs(conn), prependConn(conn, captured), ErrNotTLSRecord
-	}
+	for {
+		if err := readFullCapture(conn, header, &captured); err != nil {
+			return helloWithAddrs(conn), prependConn(conn, captured), fmt.Errorf("read TLS record header: %w", err)
+		}
+		if header[0] != tlsContentTypeHandshake {
+			return helloWithAddrs(conn), prependConn(conn, captured), ErrNotTLSRecord
+		}
 
-	recordLen := int(header[3])<<8 | int(header[4])
-	if recordLen == 0 {
-		return helloWithAddrs(conn), prependConn(conn, captured), ErrNotClientHello
-	}
+		recordLen := int(header[3])<<8 | int(header[4])
+		if recordLen == 0 || recordLen > maxTLSRecordBody {
+			return helloWithAddrs(conn), prependConn(conn, captured), ErrNotClientHello
+		}
 
-	recordBody := make([]byte, recordLen)
-	if err := readFullCapture(conn, recordBody, &captured); err != nil {
-		return helloWithAddrs(conn), prependConn(conn, captured), fmt.Errorf("read TLS record body: %w", err)
-	}
+		recordBody := make([]byte, recordLen)
+		if err := readFullCapture(conn, recordBody, &captured); err != nil {
+			return helloWithAddrs(conn), prependConn(conn, captured), fmt.Errorf("read TLS record body: %w", err)
+		}
+		handshake = append(handshake, recordBody...)
 
-	helloInfo, err := parseClientHelloRecord(recordBody)
-	helloInfo.ClientAddr = conn.RemoteAddr()
-	helloInfo.LocalAddr = conn.LocalAddr()
-	return helloInfo, prependConn(conn, captured), err
+		if len(handshake) >= 4 && handshake[0] != tlsHandshakeTypeClientHi {
+			return helloWithAddrs(conn), prependConn(conn, captured), ErrNotClientHello
+		}
+		if len(handshake) >= 4 {
+			msgLen := int(handshake[1])<<16 | int(handshake[2])<<8 | int(handshake[3])
+			if msgLen <= 0 || msgLen > maxClientHelloMessage {
+				return helloWithAddrs(conn), prependConn(conn, captured), ErrNotClientHello
+			}
+			if 4+msgLen <= len(handshake) {
+				helloInfo, err := parseClientHelloRecord(handshake[:4+msgLen])
+				helloInfo.HandshakeMessage = handshake[:4+msgLen]
+				helloInfo.ClientAddr = conn.RemoteAddr()
+				helloInfo.LocalAddr = conn.LocalAddr()
+				return helloInfo, prependConn(conn, captured), err
+			}
+		}
+		if len(handshake) > maxClientHelloMessage {
+			return helloWithAddrs(conn), prependConn(conn, captured), ErrNotClientHello
+		}
+	}
+}
+
+// ClientHelloSpan extracts the exact ClientHello handshake-message bytes from
+// captured wire data that begins at the first TLS record. The message may
+// span multiple records: record headers are skipped and the message length
+// prefix decides the span. The returned slice aliases captured.
+func ClientHelloSpan(captured []byte) ([]byte, error) {
+	var handshake []byte
+	for pos := 0; pos < len(captured); {
+		if len(captured)-pos < tlsRecordHeaderLen {
+			return nil, ErrNotClientHello
+		}
+		if captured[pos] != tlsContentTypeHandshake {
+			return nil, ErrNotTLSRecord
+		}
+		recordLen := int(captured[pos+3])<<8 | int(captured[pos+4])
+		if recordLen == 0 || recordLen > maxTLSRecordBody || len(captured)-pos-tlsRecordHeaderLen < recordLen {
+			return nil, ErrNotClientHello
+		}
+		handshake = append(handshake, captured[pos+tlsRecordHeaderLen:pos+tlsRecordHeaderLen+recordLen]...)
+		pos += tlsRecordHeaderLen + recordLen
+	}
+	if len(handshake) < 4 || handshake[0] != tlsHandshakeTypeClientHi {
+		return nil, ErrNotClientHello
+	}
+	msgLen := int(handshake[1])<<16 | int(handshake[2])<<8 | int(handshake[3])
+	if msgLen <= 0 || 4+msgLen > len(handshake) {
+		return nil, ErrNotClientHello
+	}
+	return handshake[:4+msgLen], nil
 }
 
 func parseClientHelloRecord(recordBody []byte) (ClientHelloInfo, error) {

@@ -42,6 +42,12 @@ type Conn struct {
 	inCipher  *recordCipher
 	outCipher *recordCipher
 
+	// exporterSecret is the TLS 1.3 exporter master secret derived during
+	// the handshake (RFC 8446 Section 7.5). It is set under stateMu at the
+	// same publish point as handshakeComplete and stays nil until then, so
+	// ExportKeyingMaterial fails cleanly before a successful handshake.
+	exporterSecret []byte
+
 	readMu  sync.Mutex
 	readBuf []byte
 
@@ -73,6 +79,47 @@ func (c *Conn) ConnectionState() ConnectionState {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
 	return c.state
+}
+
+// Exporter inputs are caller-controlled, and both cross an encoding limit:
+// RFC 8446 Section 7.1 carries the output length and the "tls13 "-prefixed
+// label in single-byte vector fields, and HKDF-Expand refuses to produce more
+// than 255 blocks of the hash size. Values past those limits must surface as
+// errors instead of a panic inside hkdf.Expand or a silently truncated label.
+const (
+	maxExporterLabelLen = 255 - len("tls13 ")
+	maxExporterLength   = 255 * sha256.Size
+)
+
+// ExportKeyingMaterial returns TLS 1.3 exported keying material for this
+// connection (RFC 8446 Section 7.5), byte-identical to what a crypto/tls
+// peer derives via ConnectionState.ExportKeyingMaterial for the same label,
+// context, and length. Both ends of the same session produce equal output,
+// which lets callers detect a relay that terminated and re-established TLS
+// in between. It fails before the handshake completes and after a failed
+// handshake; concurrent calls are safe.
+func (c *Conn) ExportKeyingMaterial(label string, context []byte, length int) ([]byte, error) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	if !c.handshakeComplete || len(c.exporterSecret) == 0 {
+		return nil, errors.New("tls: keying material is unavailable before a successful handshake")
+	}
+	if length < 0 {
+		return nil, errors.New("tls: keying material length must be non-negative")
+	}
+	if length > maxExporterLength {
+		return nil, fmt.Errorf("tls: requested %d bytes of keying material, maximum is %d", length, maxExporterLength)
+	}
+	if len(label) > maxExporterLabelLen {
+		return nil, fmt.Errorf("tls: keying material label must be at most %d bytes", maxExporterLabelLen)
+	}
+	// RFC 8446 Section 7.5 derives with an empty transcript — Hash("") is a
+	// 32-byte value, not an empty context field — and feeds the application
+	// context only into the second expand, matching crypto/tls.
+	emptyTranscript := sha256.Sum256(nil)
+	derived := deriveSecret(c.exporterSecret, label, emptyTranscript[:])
+	contextHash := sha256.Sum256(context)
+	return hkdfExpandLabel(derived, "exporter", contextHash[:], length), nil
 }
 
 func (c *Conn) HandshakeContext(ctx context.Context) error {
@@ -553,6 +600,14 @@ func (c *Conn) handshake(ctx context.Context, s *Server) error {
 	clientAppTrafficSecret := deriveSecret(masterSecret, "c ap traffic", th3)
 	serverAppTrafficSecret := deriveSecret(masterSecret, "s ap traffic", th3)
 
+	// RFC 8446 Section 7.5: the exporter master secret uses the same
+	// transcript window as the application traffic secrets
+	// (ClientHello...server Finished), so it is derived here and retained
+	// for ExportKeyingMaterial. Two ends of the SAME session derive
+	// identical exporter output; independently terminated sessions do not,
+	// which is the property MITM/pass-through verification compares.
+	exporterSecret := deriveSecret(masterSecret, "exp master", th3)
+
 	clientAppKey := hkdfExpandLabel(clientAppTrafficSecret, "key", nil, 16)
 	clientAppIV := hkdfExpandLabel(clientAppTrafficSecret, "iv", nil, 12)
 	serverAppKey := hkdfExpandLabel(serverAppTrafficSecret, "key", nil, 16)
@@ -587,6 +642,7 @@ func (c *Conn) handshake(ctx context.Context, s *Server) error {
 	c.inCipher = clientAppCipher
 	c.outCipher = serverAppCipher
 	c.state = state
+	c.exporterSecret = exporterSecret
 	c.handshakeComplete = true
 	c.stateMu.Unlock()
 

@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -277,5 +278,54 @@ func TestConnExportKeyingMaterialFailsAfterFailedHandshake(t *testing.T) {
 	}
 	if out, err := srvConn.ExportKeyingMaterial(exportTestLabel, []byte(exportTestContext), 32); err == nil {
 		t.Fatalf("export after failed handshake succeeded with %d bytes", len(out))
+	}
+}
+
+// TestConnExportKeyingMaterialInputLimits pins the caller-input bounds from
+// the review: the maximum HKDF-Expand output of 255 SHA-256 blocks and the
+// largest label that still fits the one-byte HkdfLabel length field. Values
+// one past each limit must fail with an error, not panic or truncate.
+func TestConnExportKeyingMaterialInputLimits(t *testing.T) {
+	certPEM, rawLis, _, accepted := newExporterTestListener(t, acceptAnyTranscript)
+	conf := exportTestClientConfig(t, certPEM)
+
+	clientCh := dialExportTestClientAsync(t, rawLis.Addr().String(), conf)
+	srvConn := exportServerSideConn(t, accepted)
+	completeServerHandshake(t, srvConn)
+	client := <-clientCh
+	if client.err != nil {
+		t.Fatalf("client handshake: %v", client.err)
+	}
+
+	longestLabel := strings.Repeat("l", 255-len("tls13 "))
+	cases := []struct {
+		name    string
+		label   string
+		context []byte
+		length  int
+		wantErr bool
+	}{
+		{name: "max expand length ok", label: exportTestLabel, context: []byte(exportTestContext), length: 255 * 32},
+		{name: "one past max expand length", label: exportTestLabel, context: []byte(exportTestContext), length: 255*32 + 1, wantErr: true},
+		{name: "longest label ok", label: longestLabel, context: nil, length: 32},
+		{name: "label one byte too long", label: longestLabel + "l", context: nil, length: 32, wantErr: true},
+		{name: "negative length", label: exportTestLabel, context: nil, length: -1, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := srvConn.ExportKeyingMaterial(tc.label, tc.context, tc.length)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for label=%d len=%d, got %d bytes", len(tc.label), tc.length, len(out))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("export: %v", err)
+			}
+			if len(out) != tc.length {
+				t.Fatalf("export returned %d bytes, want %d", len(out), tc.length)
+			}
+		})
 	}
 }

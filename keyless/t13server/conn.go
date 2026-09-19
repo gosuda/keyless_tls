@@ -81,6 +81,16 @@ func (c *Conn) ConnectionState() ConnectionState {
 	return c.state
 }
 
+// Exporter inputs are caller-controlled, and both cross an encoding limit:
+// RFC 8446 Section 7.1 carries the output length and the "tls13 "-prefixed
+// label in single-byte vector fields, and HKDF-Expand refuses to produce more
+// than 255 blocks of the hash size. Values past those limits must surface as
+// errors instead of a panic inside hkdf.Expand or a silently truncated label.
+const (
+	maxExporterLabelLen = 255 - len("tls13 ")
+	maxExporterLength   = 255 * sha256.Size
+)
+
 // ExportKeyingMaterial returns TLS 1.3 exported keying material for this
 // connection (RFC 8446 Section 7.5), byte-identical to what a crypto/tls
 // peer derives via ConnectionState.ExportKeyingMaterial for the same label,
@@ -96,6 +106,12 @@ func (c *Conn) ExportKeyingMaterial(label string, context []byte, length int) ([
 	}
 	if length < 0 {
 		return nil, errors.New("tls: keying material length must be non-negative")
+	}
+	if length > maxExporterLength {
+		return nil, fmt.Errorf("tls: requested %d bytes of keying material, maximum is %d", length, maxExporterLength)
+	}
+	if len(label) > maxExporterLabelLen {
+		return nil, fmt.Errorf("tls: keying material label must be at most %d bytes", maxExporterLabelLen)
 	}
 	// RFC 8446 Section 7.5 derives with an empty transcript — Hash("") is a
 	// 32-byte value, not an empty context field — and feeds the application

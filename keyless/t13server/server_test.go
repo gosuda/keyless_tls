@@ -1162,7 +1162,7 @@ func TestTLS13Server_FragmentedClientHello(t *testing.T) {
 	}
 }
 
-func TestTLS13Server_DefaultALPNIsHTTP11(t *testing.T) {
+func TestTLS13Server_EmptyNextProtosDoesNotNegotiateALPN(t *testing.T) {
 	certPEM, keyPEM, err := testutil.GenerateCert("example.com", false)
 	if err != nil {
 		t.Fatalf("generate cert: %v", err)
@@ -1178,7 +1178,7 @@ func TestTLS13Server_DefaultALPNIsHTTP11(t *testing.T) {
 		CertPEM:          certPEM,
 		KeyID:            "test-key",
 		TranscriptSigner: signerSvc,
-		// NextProtos intentionally omitted to test default
+		// NextProtos intentionally omitted: the library must not impose an application protocol
 	})
 	if err != nil {
 		t.Fatalf("new server: %v", err)
@@ -1212,11 +1212,11 @@ func TestTLS13Server_DefaultALPNIsHTTP11(t *testing.T) {
 		}
 	}
 
-	if client.ConnectionState().NegotiatedProtocol != "http/1.1" {
-		t.Fatalf("expected negotiated protocol http/1.1, got %q", client.ConnectionState().NegotiatedProtocol)
+	if got := client.ConnectionState().NegotiatedProtocol; got != "" {
+		t.Fatalf("expected no negotiated protocol, got %q", got)
 	}
-	if serverConn.ConnectionState().NegotiatedProtocol != "http/1.1" {
-		t.Fatalf("expected server negotiated protocol http/1.1, got %q", serverConn.ConnectionState().NegotiatedProtocol)
+	if got := serverConn.ConnectionState().NegotiatedProtocol; got != "" {
+		t.Fatalf("expected no server negotiated protocol, got %q", got)
 	}
 }
 

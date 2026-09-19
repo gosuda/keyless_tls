@@ -77,10 +77,6 @@ func NewServer(cfg Config) (*Server, error) {
 		}
 	}
 
-	if len(cfg.NextProtos) == 0 {
-		cfg.NextProtos = []string{"http/1.1"}
-	}
-
 	return &Server{
 		cfg:       cfg,
 		sigScheme: scheme,

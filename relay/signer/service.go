@@ -30,11 +30,18 @@ func (f TranscriptValidatorFunc) ValidateTranscript(ctx context.Context, req *si
 	return f(ctx, req)
 }
 
+// Service signs TLS 1.3 CertificateVerify transcripts for the /v1/sign
+// endpoint. The library owns the mechanism: the request must carry the
+// handshake transcript, the timestamp must be fresh, and the signature must
+// answer exactly that transcript. Whether a request needs additional
+// authorization is deployment policy, so the optional TranscriptValidator is
+// the only policy hook: when it is nil, every structurally valid request is
+// signed, and consumers that enforce binding semantics (leases, streams,
+// hostnames) must configure one.
 type Service struct {
-	Store                         KeyStore
-	AllowedSkew                   time.Duration
-	TranscriptValidator           TranscriptValidator
-	AllowUnboundTranscriptSigning bool
+	Store               KeyStore
+	AllowedSkew         time.Duration
+	TranscriptValidator TranscriptValidator
 }
 
 func (s *Service) SignTranscript(ctx context.Context, req *signrpc.TranscriptSignRequest) (*signrpc.TranscriptSignResponse, error) {
@@ -64,8 +71,6 @@ func (s *Service) SignTranscript(ctx context.Context, req *signrpc.TranscriptSig
 		if err := s.TranscriptValidator.ValidateTranscript(ctx, req); err != nil {
 			return nil, fmt.Errorf("%w: %s", ErrPermissionDenied, err.Error())
 		}
-	} else if !s.AllowUnboundTranscriptSigning {
-		return nil, fmt.Errorf("%w: transcript validator is required (or set AllowUnboundTranscriptSigning)", ErrPermissionDenied)
 	}
 
 	signer, err := s.Store.Signer(ctx, req.KeyID)

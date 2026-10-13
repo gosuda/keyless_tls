@@ -452,6 +452,25 @@ library's core guarantee, not one deployment's hardening choice.
 
 ## Security and operations notes
 
+### Lease lifecycle authorization
+
+`lifecycle.NewManager` now requires a non-nil `ManagerConfig.Authorizer`. The authorizer
+receives the requested lease ID, operation (`issue`, `load`, `renew`, `reissue`),
+caller context, and `ChallengeProof`. Issue, load, renew, and reissue all check
+authorization **before** reading or modifying the lease, or returning a private key.
+`LoadIdentity` and `RenewIdentity` now require a `ChallengeProof` argument.
+The former `RequireChallenge` and `Validator` fields have been removed.
+
+Embeddings must attach an authenticated principal to the context, not caller-supplied
+identity claims. Their authorizer must verify that principal's permission for the
+**specific** lease and operation, reject expired or replayed nonces, and consume each
+proof once. Renewals and reissues must verify current-key possession or explicit
+recovery authority. A generic reusable proof is insufficient.
+
+`lifecycle.NewTrustedManager` is an explicit bypass for a fully trusted in-process
+coordinator that is already authorized for every lease. Do not expose a trusted
+manager to any tenant-controlled or otherwise limited caller.
+
 - Store private keys only in `relay-signer`; never distribute them to tunnel apps
 - Keep only the public certificate chain in tunnel apps
 - Enforce signer mTLS and pair it with `KeyID`-scoped ACLs

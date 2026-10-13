@@ -1,6 +1,7 @@
 package lifecycle
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -21,7 +22,7 @@ func TestLifecycleIssueLoadRenewAndValidate(t *testing.T) {
 
 	ctx := context.Background()
 	clock := newTestClock(time.Now().UTC())
-	manager := newTestManager(t, clock, true)
+	manager := newTestManager(t, clock, staticAuthorizer{})
 
 	issued, err := manager.IssueIdentity(ctx, "lease-a", ChallengeProof{Nonce: "nonce-ok", Token: "token-ok"}, map[string]string{"node": "alpha"})
 	if err != nil {
@@ -31,7 +32,7 @@ func TestLifecycleIssueLoadRenewAndValidate(t *testing.T) {
 		t.Fatalf("expected epoch=1, got %d", issued.Epoch)
 	}
 
-	loaded, err := manager.LoadIdentity(ctx, "lease-a")
+	loaded, err := manager.LoadIdentity(ctx, "lease-a", ChallengeProof{Nonce: "nonce-ok", Token: "token-ok"})
 	if err != nil {
 		t.Fatalf("load identity: %v", err)
 	}
@@ -48,7 +49,7 @@ func TestLifecycleIssueLoadRenewAndValidate(t *testing.T) {
 		t.Fatalf("issued identity should not be marked prior")
 	}
 
-	renewed, err := manager.RenewIdentity(ctx, "lease-a")
+	renewed, err := manager.RenewIdentity(ctx, "lease-a", ChallengeProof{Nonce: "nonce-ok", Token: "token-ok"})
 	if err != nil {
 		t.Fatalf("renew identity: %v", err)
 	}
@@ -79,7 +80,7 @@ func TestLifecycleChallengeAndReissueRules(t *testing.T) {
 
 	ctx := context.Background()
 	clock := newTestClock(time.Now().UTC())
-	manager := newTestManager(t, clock, true)
+	manager := newTestManager(t, clock, staticAuthorizer{})
 
 	if _, err := manager.IssueIdentity(ctx, "lease-b", ChallengeProof{}, nil); !errors.Is(err, ErrChallengeRequired) {
 		t.Fatalf("expected challenge required, got %v", err)
@@ -106,7 +107,7 @@ func TestLifecycleLoadCorruptionIsDeterministic(t *testing.T) {
 
 	ctx := context.Background()
 	clock := newTestClock(time.Now().UTC())
-	manager := newTestManager(t, clock, false)
+	manager := newTestManager(t, clock, nil)
 
 	if _, err := manager.IssueIdentity(ctx, "lease-corrupt", ChallengeProof{}, nil); err != nil {
 		t.Fatalf("issue identity: %v", err)
@@ -118,7 +119,7 @@ func TestLifecycleLoadCorruptionIsDeterministic(t *testing.T) {
 		t.Fatalf("overwrite store file: %v", err)
 	}
 
-	if _, err := manager.LoadIdentity(ctx, "lease-corrupt"); !errors.Is(err, ErrCorruptStore) {
+	if _, err := manager.LoadIdentity(ctx, "lease-corrupt", ChallengeProof{}); !errors.Is(err, ErrCorruptStore) {
 		t.Fatalf("expected corrupt store error, got %v", err)
 	}
 	if _, err := os.Stat(path + ".corrupt"); err != nil {
@@ -131,7 +132,7 @@ func TestLifecycleValidateRejectsMismatchedLease(t *testing.T) {
 
 	ctx := context.Background()
 	clock := newTestClock(time.Now().UTC())
-	manager := newTestManager(t, clock, false)
+	manager := newTestManager(t, clock, nil)
 
 	if _, err := manager.IssueIdentity(ctx, "lease-match", ChallengeProof{}, nil); err != nil {
 		t.Fatalf("issue identity: %v", err)
@@ -147,16 +148,168 @@ func TestLifecycleValidateRejectsMismatchedLease(t *testing.T) {
 	}
 }
 
-type staticValidator struct{}
 
-func (staticValidator) ValidateChallenge(_ context.Context, _ string, proof ChallengeProof) error {
+func TestLifecycleSecureConstructorRequiresAuthorizer(t *testing.T) {
+	t.Parallel()
+	clock := newTestClock(time.Now().UTC())
+	trusted := newTestManager(t, clock, nil)
+	if _, err := NewManager(trusted.cfg); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("expected a missing-authorizer error, got %v", err)
+	}
+	secure := newTestManager(t, clock, staticAuthorizer{})
+	if _, err := NewTrustedManager(secure.cfg); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("trusted constructor must reject an authorizer, got %v", err)
+	}
+}
+
+func TestLifecycleSensitiveOperationsRequireProof(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	manager := newTestManager(t, newTestClock(time.Now().UTC()), staticAuthorizer{})
+	proof := ChallengeProof{Nonce: "nonce-ok", Token: "token-ok"}
+	if _, err := manager.IssueIdentity(ctx, "lease-a", proof, nil); err != nil {
+		t.Fatalf("issue identity: %v", err)
+	}
+	tests := []struct {
+		name string
+		run  func() (*IdentityBundle, error)
+	}{
+		{"issue", func() (*IdentityBundle, error) { return manager.IssueIdentity(ctx, "lease-b", ChallengeProof{}, nil) }},
+		{"load", func() (*IdentityBundle, error) { return manager.LoadIdentity(ctx, "lease-a", ChallengeProof{}) }},
+		{"renew", func() (*IdentityBundle, error) { return manager.RenewIdentity(ctx, "lease-a", ChallengeProof{}) }},
+		{"reissue", func() (*IdentityBundle, error) { return manager.ReissueIdentity(ctx, "lease-a", ChallengeProof{}, "recovery") }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			bundle, err := test.run()
+			if bundle != nil || !errors.Is(err, ErrChallengeRequired) {
+				t.Fatalf("expected no bundle and ErrChallengeRequired, got bundle=%v, err=%v", bundle, err)
+			}
+		})
+	}
+}
+
+type leasePrincipalKey struct{}
+type leaseBoundAuthorizer struct{}
+
+func (leaseBoundAuthorizer) AuthorizeLease(ctx context.Context, leaseID string, operation LeaseOperation, proof ChallengeProof) error {
+	principal, ok := ctx.Value(leasePrincipalKey{}).(string)
+	if !ok || principal != leaseID {
+		return errors.New("principal does not own lease")
+	}
+	if proof.Nonce != "nonce-"+leaseID || proof.Token != "token-"+leaseID {
+		return errors.New("proof does not match lease")
+	}
+	switch operation {
+	case LeaseOperationIssue, LeaseOperationLoad, LeaseOperationRenew, LeaseOperationReissue:
+		return nil
+	default:
+		return errors.New("unrecognized lease operation")
+	}
+}
+
+func TestLifecycleRejectsCrossLeaseAccess(t *testing.T) {
+	t.Parallel()
+	manager := newTestManager(t, newTestClock(time.Now().UTC()), leaseBoundAuthorizer{})
+	ctxA := context.WithValue(context.Background(), leasePrincipalKey{}, "lease-a")
+	ctxB := context.WithValue(context.Background(), leasePrincipalKey{}, "lease-b")
+	proofA := ChallengeProof{Nonce: "nonce-lease-a", Token: "token-lease-a"}
+	proofB := ChallengeProof{Nonce: "nonce-lease-b", Token: "token-lease-b"}
+	if _, err := manager.IssueIdentity(ctxA, "lease-a", proofA, nil); err != nil {
+		t.Fatalf("issue lease-a: %v", err)
+	}
+	initial, err := manager.IssueIdentity(ctxB, "lease-b", proofB, nil)
+	if err != nil {
+		t.Fatalf("issue lease-b: %v", err)
+	}
+	tests := []struct {
+		name string
+		run  func() (*IdentityBundle, error)
+	}{
+		{"issue", func() (*IdentityBundle, error) {
+			return manager.IssueIdentity(ctxA, "lease-c", ChallengeProof{
+				Nonce: "nonce-lease-c", Token: "token-lease-c",
+			}, nil)
+		}},
+		{"load", func() (*IdentityBundle, error) { return manager.LoadIdentity(ctxA, "lease-b", proofB) }},
+		{"renew", func() (*IdentityBundle, error) { return manager.RenewIdentity(ctxA, "lease-b", proofB) }},
+		{"reissue", func() (*IdentityBundle, error) { return manager.ReissueIdentity(ctxA, "lease-b", proofB, "recovery") }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			bundle, err := test.run()
+			if bundle != nil || !errors.Is(err, ErrChallengeRejected) {
+				t.Fatalf("expected authorization rejection, got bundle=%v, err=%v", bundle, err)
+			}
+		})
+	}
+	current, err := manager.LoadIdentity(ctxB, "lease-b", proofB)
+	if err != nil {
+		t.Fatalf("load authorized lease-b: %v", err)
+	}
+	if current.Epoch != initial.Epoch || !bytes.Equal(current.KeyPEM, initial.KeyPEM) {
+		t.Fatal("rejected cross-lease calls changed the victim credential")
+	}
+}
+
+func TestLifecycleTrustedModeIsExplicit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	manager := newTestManager(t, newTestClock(time.Now().UTC()), nil)
+	issued, err := manager.IssueIdentity(ctx, "trusted-lease", ChallengeProof{}, nil)
+	if err != nil {
+		t.Fatalf("trusted issue: %v", err)
+	}
+	if _, err := manager.LoadIdentity(ctx, issued.LeaseID, ChallengeProof{}); err != nil {
+		t.Fatalf("trusted load: %v", err)
+	}
+	if _, err := manager.RenewIdentity(ctx, issued.LeaseID, ChallengeProof{}); err != nil {
+		t.Fatalf("trusted renew: %v", err)
+	}
+}
+
+type expectedLeaseOperationKey struct{}
+type operationCheckingAuthorizer struct{}
+
+func (operationCheckingAuthorizer) AuthorizeLease(ctx context.Context, _ string, operation LeaseOperation, _ ChallengeProof) error {
+	expected, ok := ctx.Value(expectedLeaseOperationKey{}).(LeaseOperation)
+	if !ok || expected != operation {
+		return errors.New("unexpected lease operation")
+	}
+	return nil
+}
+
+func TestLifecyclePassesOperationToAuthorizer(t *testing.T) {
+	t.Parallel()
+	manager := newTestManager(t, newTestClock(time.Now().UTC()), operationCheckingAuthorizer{})
+	proof := ChallengeProof{Nonce: "nonce", Token: "token"}
+	ctxFor := func(op LeaseOperation) context.Context {
+		return context.WithValue(context.Background(), expectedLeaseOperationKey{}, op)
+	}
+	if _, err := manager.IssueIdentity(ctxFor(LeaseOperationIssue), "lease-ops", proof, nil); err != nil {
+		t.Fatalf("authorize issue: %v", err)
+	}
+	if _, err := manager.LoadIdentity(ctxFor(LeaseOperationLoad), "lease-ops", proof); err != nil {
+		t.Fatalf("authorize load: %v", err)
+	}
+	if _, err := manager.RenewIdentity(ctxFor(LeaseOperationRenew), "lease-ops", proof); err != nil {
+		t.Fatalf("authorize renew: %v", err)
+	}
+	if _, err := manager.ReissueIdentity(ctxFor(LeaseOperationReissue), "lease-ops", proof, "recovery"); err != nil {
+		t.Fatalf("authorize reissue: %v", err)
+	}
+}
+
+type staticAuthorizer struct{}
+
+func (staticAuthorizer) AuthorizeLease(_ context.Context, _ string, _ LeaseOperation, proof ChallengeProof) error {
 	if strings.TrimSpace(proof.Nonce) != "nonce-ok" || strings.TrimSpace(proof.Token) != "token-ok" {
 		return errors.New("invalid proof")
 	}
 	return nil
 }
 
-func newTestManager(t *testing.T, clock *testClock, requireChallenge bool) *Manager {
+func newTestManager(t *testing.T, clock *testClock, authorizer LeaseAuthorizer) *Manager {
 	t.Helper()
 
 	issuerCertPEM, issuerKeyPEM := issueTestCA(t, clock.Now().Add(-time.Hour), clock.Now().Add(365*24*time.Hour))
@@ -165,17 +318,22 @@ func newTestManager(t *testing.T, clock *testClock, requireChallenge bool) *Mana
 		t.Fatalf("create disk store: %v", err)
 	}
 
-	manager, err := NewManager(ManagerConfig{
+	cfg := ManagerConfig{
 		Store:            store,
 		IssuerCertPEM:    issuerCertPEM,
 		IssuerKeyPEM:     issuerKeyPEM,
 		CertTTL:          30 * time.Minute,
 		OverlapGrace:     2 * time.Minute,
 		ReissueMinPeriod: 10 * time.Second,
-		RequireChallenge: requireChallenge,
-		Validator:        staticValidator{},
+		Authorizer:       authorizer,
 		Now:              clock.Now,
-	})
+	}
+	var manager *Manager
+	if authorizer == nil {
+		manager, err = NewTrustedManager(cfg)
+	} else {
+		manager, err = NewManager(cfg)
+	}
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}

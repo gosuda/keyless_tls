@@ -42,3 +42,14 @@ func validateStoreDirectory(info os.FileInfo, final bool) error {
 	}
 	return nil
 }
+
+func validateTemporaryFile(info os.FileInfo) error {
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		return errors.New("temporary lease file must be private and regular")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != uint32(os.Geteuid()) {
+		return errors.New("temporary lease file owner cannot be trusted")
+	}
+	return nil
+}

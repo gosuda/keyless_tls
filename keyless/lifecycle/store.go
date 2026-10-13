@@ -102,6 +102,16 @@ func (d *DiskStore) Save(_ context.Context, state *leaseState) error {
 		_ = file.Close()
 		return fmt.Errorf("set temporary lease permissions: %w", err)
 	}
+
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return fmt.Errorf("stat temporary lease file: %w", err)
+	}
+	if err := validateTemporaryFile(info); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("invalid temporary lease file: %w", err)
+	}
 	if _, err := file.Write(blob); err != nil {
 		_ = file.Close()
 		return fmt.Errorf("write temporary lease file: %w", err)

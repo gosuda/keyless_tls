@@ -12,8 +12,11 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/gosuda/keyless_tls/internal/admission"
 	"github.com/gosuda/keyless_tls/relay/signrpc"
 )
 
@@ -21,6 +24,12 @@ var (
 	ErrInvalidArgument  = errors.New("invalid argument")
 	ErrPermissionDenied = errors.New("permission denied")
 	ErrInternal         = errors.New("internal")
+	ErrOverloaded       = errors.New("signing capacity exhausted")
+)
+
+const (
+	defaultMaxConcurrentSigns       = 32
+	defaultMaxConcurrentSignsPerKey = 8
 )
 
 type TranscriptValidator interface {
@@ -45,6 +54,39 @@ type Service struct {
 	Store               KeyStore
 	AllowedSkew         time.Duration
 	TranscriptValidator TranscriptValidator
+
+	// Zero uses the safe defaults (32 globally, eight per key). Set before
+	// the first request; do not modify configuration during concurrent use.
+	MaxConcurrentSigns       int
+	MaxConcurrentSignsPerKey int
+
+	admissionOnce sync.Once
+	admission     *admission.Limiter
+	rejectedSigns atomic.Uint64
+}
+
+// RejectedSigns reports overload decisions made by this service.
+func (s *Service) RejectedSigns() uint64 {
+	return s.rejectedSigns.Load()
+}
+
+func (s *Service) signingAdmission() *admission.Limiter {
+	s.admissionOnce.Do(func() {
+		total := s.MaxConcurrentSigns
+		if total == 0 {
+			total = defaultMaxConcurrentSigns
+		}
+		perKey := s.MaxConcurrentSignsPerKey
+		if perKey == 0 {
+			perKey = defaultMaxConcurrentSignsPerKey
+		}
+		s.admission = admission.New(admission.Limits{
+			MaxConcurrent:  total,
+			MaxPerIdentity: perKey,
+			MaxIdentities:  total,
+		})
+	})
+	return s.admission
 }
 
 func (s *Service) SignTranscript(ctx context.Context, req *signrpc.TranscriptSignRequest) (*signrpc.TranscriptSignResponse, error) {
@@ -59,6 +101,9 @@ func (s *Service) SignTranscript(ctx context.Context, req *signrpc.TranscriptSig
 	}
 	if s.Store == nil {
 		return nil, fmt.Errorf("%w: signer store is not configured", ErrInternal)
+	}
+	if s.MaxConcurrentSigns < 0 || s.MaxConcurrentSignsPerKey < 0 {
+		return nil, fmt.Errorf("%w: signing concurrency limits must not be negative", ErrInternal)
 	}
 
 	skew := s.AllowedSkew
@@ -75,6 +120,19 @@ func (s *Service) SignTranscript(ctx context.Context, req *signrpc.TranscriptSig
 			return nil, fmt.Errorf("%w: %s", ErrPermissionDenied, err.Error())
 		}
 	}
+
+	// Fail fast rather than starting an unbounded number of crypto.Signer
+	// calls. The permit covers key lookup too, since HSM-backed stores may
+	// allocate scarce sessions during lookup.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	limiter := s.signingAdmission()
+	if !limiter.TryAcquire(req.KeyID) {
+		s.rejectedSigns.Add(1)
+		return nil, ErrOverloaded
+	}
+	defer limiter.Release(req.KeyID)
 
 	signer, err := s.Store.Signer(ctx, req.KeyID)
 	if err != nil {

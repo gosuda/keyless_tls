@@ -14,6 +14,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/gosuda/keyless_tls/internal/admission"
 	"github.com/gosuda/keyless_tls/relay/signrpc"
 )
 
@@ -22,6 +23,15 @@ type TranscriptSigner interface {
 }
 
 type ConnectionState = tls.ConnectionState
+
+var ErrHandshakeOverloaded = errors.New("TLS handshake admission limit exceeded")
+
+const (
+	defaultConcurrentHandshakes = 64
+	defaultHandshakesPerSource  = 8
+	defaultHandshakeRate        = 20
+	defaultHandshakeBurst       = 40
+)
 
 type Config struct {
 	// Certificates is the raw DER certificate chain. The first is the leaf.
@@ -36,16 +46,44 @@ type Config struct {
 	TranscriptSigner TranscriptSigner
 	// HandshakeTimeout is the maximum duration allowed for the TLS handshake. Defaults to 10s.
 	HandshakeTimeout time.Duration
+	// Handshake admission is shared by every connection from this Server,
+	// including NewConn, ServeConn, and Listener. Zero uses safe defaults.
+	MaxConcurrentHandshakes      int
+	MaxHandshakesPerSource       int
+	HandshakesPerSourcePerSecond int
+	HandshakeBurstPerSource      int
 }
 
 type Server struct {
 	cfg Config
 
-	sigScheme uint16
-	sigAlg    string
+	sigScheme          uint16
+	sigAlg             string
+	handshakeAdmission *admission.Limiter
 }
 
 func NewServer(cfg Config) (*Server, error) {
+	if cfg.MaxConcurrentHandshakes < 0 || cfg.MaxHandshakesPerSource < 0 ||
+		cfg.HandshakesPerSourcePerSecond < 0 || cfg.HandshakeBurstPerSource < 0 {
+		return nil, errors.New("handshake admission limits must not be negative")
+	}
+	total := cfg.MaxConcurrentHandshakes
+	if total == 0 {
+		total = defaultConcurrentHandshakes
+	}
+	perSource := cfg.MaxHandshakesPerSource
+	if perSource == 0 {
+		perSource = defaultHandshakesPerSource
+	}
+	rate := cfg.HandshakesPerSourcePerSecond
+	if rate == 0 {
+		rate = defaultHandshakeRate
+	}
+	burst := cfg.HandshakeBurstPerSource
+	if burst == 0 {
+		burst = defaultHandshakeBurst
+	}
+
 	if len(cfg.Certificates) == 0 && len(cfg.CertPEM) > 0 {
 		ders, err := parseCertificatesFromPEM(cfg.CertPEM)
 		if err != nil {
@@ -81,7 +119,34 @@ func NewServer(cfg Config) (*Server, error) {
 		cfg:       cfg,
 		sigScheme: scheme,
 		sigAlg:    alg,
+		handshakeAdmission: admission.New(admission.Limits{
+			MaxConcurrent:  total,
+			MaxPerIdentity: perSource,
+			MaxIdentities:  4096,
+			RatePerSecond:  rate,
+			Burst:          burst,
+		}),
 	}, nil
+}
+
+// RejectedHandshakes counts admission rejections, including global capacity,
+// per-source concurrency, rate, and bounded identity registry exhaustion.
+func (s *Server) RejectedHandshakes() uint64 {
+	return s.handshakeAdmission.Rejections()
+}
+
+func sourceIdentity(raw net.Conn) string {
+	addr := raw.RemoteAddr()
+	if addr == nil {
+		return ""
+	}
+	if tcp, ok := addr.(*net.TCPAddr); ok {
+		return tcp.IP.String()
+	}
+	if host, _, err := net.SplitHostPort(addr.String()); err == nil {
+		return host
+	}
+	return addr.String()
 }
 
 func (s *Server) NewConn(raw net.Conn, binding []byte) *Conn {

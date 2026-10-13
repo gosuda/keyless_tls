@@ -21,12 +21,20 @@ func main() {
 		clientCA                  = flag.String("client-ca", "", "client CA PEM path")
 		signKey                   = flag.String("sign-key", "", "keyless signing private key PEM path")
 		allowInsecureNoClientAuth = flag.Bool("allow-insecure-no-client-auth", false, "permit running without client certificate verification (-client-ca) (insecure/demo mode)")
+		maxSigns                  = flag.Int("max-signs", 32, "maximum concurrent private-key operations across all keys")
+		maxSignsPerKey            = flag.Int("max-signs-per-key", 8, "maximum concurrent private-key operations per key")
+		maxClientConcurrent       = flag.Int("max-client-concurrent", 4, "maximum concurrent requests per mTLS client")
+		clientRate                = flag.Int("client-rate", 20, "maximum sustained sign requests per second per mTLS client")
+		clientBurst               = flag.Int("client-burst", 40, "maximum burst requests per mTLS client")
 	)
 	flag.Parse()
 
 	required(*certPath, "tls-cert")
 	required(*keyPath, "tls-key")
 	required(*signKey, "sign-key")
+	if *maxSigns <= 0 || *maxSignsPerKey <= 0 || *maxClientConcurrent <= 0 || *clientRate <= 0 || *clientBurst <= 0 {
+		log.Fatal("all signing admission limits must be positive")
+	}
 	if *clientCA == "" {
 		if !*allowInsecureNoClientAuth {
 			log.Fatal("-client-ca is required by default (or set -allow-insecure-no-client-auth for insecure local/demo operation)")
@@ -63,8 +71,13 @@ func main() {
 		ClientCAPEM:               caPEM,
 		AllowInsecureNoClientAuth: *allowInsecureNoClientAuth,
 		SignerService: &signer.Service{
-			Store: store,
+			Store:                    store,
+			MaxConcurrentSigns:       *maxSigns,
+			MaxConcurrentSignsPerKey: *maxSignsPerKey,
 		},
+		MaxConcurrentRequestsPerClient: *maxClientConcurrent,
+		RequestsPerClientPerSecond:     *clientRate,
+		ClientBurst:                    *clientBurst,
 	})
 	if err != nil {
 		log.Fatalf("signer server exited: %v", err)

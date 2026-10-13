@@ -123,6 +123,41 @@ example value; production integrations should derive an opaque binding from the 
 authorization context and configure a `TranscriptValidator` that verifies that binding before
 the signer produces a CertificateVerify signature.
 
+### Overload protection
+
+The signer bounds in-flight private-key operations **globally (32 by default)**
+and **per key (8 by default)**. It does not queue an unbounded number of
+operations: requests that cannot acquire a slot fail immediately with HTTP
+`429 Too Many Requests` and `Retry-After: 1`. Direct callers of
+`signer.Service` receive `signer.ErrOverloaded`. The counters are available
+through `Service.RejectedSigns()`.
+
+The HTTPS signing handler also limits each mTLS client certificate to four
+concurrent requests and a token bucket of 20 requests/second, burst 40.
+The aggregate request limit is 128, or the configured per-client concurrency
+when that is higher. Server read deadlines bound incomplete request bodies so
+they cannot retain request admission slots indefinitely.
+In explicit insecure/demo mode without mTLS, limits apply to the network
+source IP instead. Configure the signer binary with `-max-signs`,
+`-max-signs-per-key`, `-max-client-concurrent`, `-client-rate`, and
+`-client-burst` to match the HSM capacity and expected traffic.
+
+The public `t13server.Server` bounds simultaneous handshakes to 64 total
+and eight per source IP, plus a 20/s per-source bucket (burst 40). Admission
+happens before parsing ClientHello or invoking the remote signer, including
+when callers use `NewConn` directly. Excess handshakes fail with
+`t13server.ErrHandshakeOverloaded`; failures can be measured through
+`Server.RejectedHandshakes()`. Use the `t13server.Config` admission fields or
+the `examples/tunnel-http` flags (`-max-handshakes`,
+`-max-handshakes-per-source`, `-handshake-rate`, `-handshake-burst`) to
+adjust capacity. The source-IP limits use the actual TCP peer address.
+If a reverse proxy or NAT concentrates many independent users under one IP,
+adjust the per-source limits and enforce additional limits at that ingress.
+
+These controls bound resource consumption but do not authenticate a public
+TLS peer before CertificateVerify. Put an L4 connection limit in front of
+Internet-facing listeners as additional protection against distributed floods.
+
 If the signer endpoint is protected by a rotating access token, attach it with
 `RemoteSignerConfig.Headers`. The callback runs for every `/v1/sign` request and
 must be safe for concurrent use:

@@ -1,8 +1,9 @@
-name: Go tests
+name: Go verification
 
 on:
-  push:
   pull_request:
+  push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -13,8 +14,11 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - run: go test ./...
-      - run: go test -race ./relay/server
+          cache: true
+      - name: Go tests with race detector
+        run: go test -race ./...
+      - name: Go vet
+        run: go vet ./...

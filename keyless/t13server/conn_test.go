@@ -2,9 +2,16 @@ package t13server
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/gosuda/keyless_tls/internal/testutil"
+	"github.com/gosuda/keyless_tls/relay/signrpc"
 )
 
 func TestConn_PostHandshakeHandshakeMessageRejected(t *testing.T) {
@@ -240,5 +247,94 @@ func TestConn_ReadEncryptedHandshakeMessageRejectsOversize(t *testing.T) {
 
 	if _, err := conn.readEncryptedHandshakeMessage(readerCipher); err == nil || !strings.Contains(err.Error(), "exceeds maximum allowed length") {
 		t.Fatalf("expected max-length error, got: %v", err)
+	}
+}
+
+type countingTranscriptSigner struct {
+	calls atomic.Int32
+}
+
+func (s *countingTranscriptSigner) SignTranscript(
+	_ context.Context, _ *signrpc.TranscriptSignRequest,
+) (*signrpc.TranscriptSignResponse, error) {
+	s.calls.Add(1)
+	return nil, errors.New("signing should not be reached")
+}
+
+func TestHandshakeAdmission_RejectsBeforeTranscriptSigning(t *testing.T) {
+	certPEM, _, err := testutil.GenerateCert("example.com", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteSigner := &countingTranscriptSigner{}
+	server, err := NewServer(Config{
+		CertPEM:                      certPEM,
+		KeyID:                        "key",
+		TranscriptSigner:             remoteSigner,
+		MaxConcurrentHandshakes:      1,
+		MaxHandshakesPerSource:       1,
+		HandshakesPerSourcePerSecond: 1,
+		HandshakeBurstPerSource:      1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client1, raw1 := net.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer client1.Close()
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := server.ServeConn(ctx, raw1, nil)
+		firstDone <- err
+	}()
+
+	// This write completes only once the first handshake has acquired its
+	// admission slot and begun reading the incomplete ClientHello.
+	if err := client1.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client1.Write([]byte{0x16}); err != nil {
+		t.Fatalf("first handshake never began reading: %v", err)
+	}
+
+	client2, raw2 := net.Pipe()
+	defer client2.Close()
+	if _, err := server.ServeConn(context.Background(), raw2, nil); !errors.Is(err, ErrHandshakeOverloaded) {
+		t.Fatalf("excess handshake error = %v, want ErrHandshakeOverloaded", err)
+	}
+	if got := remoteSigner.calls.Load(); got != 0 {
+		t.Fatalf("overloaded handshake invoked remote signer %d times", got)
+	}
+	if got := server.RejectedHandshakes(); got != 1 {
+		t.Fatalf("overload metric = %d, want 1", got)
+	}
+
+	cancel()
+	_ = client1.Close()
+	select {
+	case <-firstDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("canceled handshake did not release its capacity")
+	}
+}
+
+type remoteAddrConn struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (c *remoteAddrConn) RemoteAddr() net.Addr { return c.remote }
+
+func TestSourceIdentityUsesIPNotPort(t *testing.T) {
+	first, other := net.Pipe()
+	defer first.Close()
+	defer other.Close()
+	ip := net.ParseIP("203.0.113.10")
+	c1 := &remoteAddrConn{Conn: first, remote: &net.TCPAddr{IP: ip, Port: 1234}}
+	c2 := &remoteAddrConn{Conn: first, remote: &net.TCPAddr{IP: ip, Port: 5678}}
+	if sourceIdentity(c1) != sourceIdentity(c2) {
+		t.Fatal("ephemeral source port bypassed handshake identity")
 	}
 }

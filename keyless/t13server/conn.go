@@ -169,6 +169,15 @@ func (c *Conn) doHandshake(ctx context.Context) error {
 		return err
 	}
 
+	// Reserve capacity before reading ClientHello, doing key exchange, or
+	// invoking TranscriptSigner. This also protects integrations that call
+	// NewConn directly rather than using the provided Listener.
+	source := sourceIdentity(c.raw)
+	if !c.server.handshakeAdmission.TryAcquire(source) {
+		return ErrHandshakeOverloaded
+	}
+	defer c.server.handshakeAdmission.Release(source)
+
 	// Compute effective handshake deadline as the earliest applicable limit among:
 	// 1) c.handshakeTimeout (configured maximum duration)
 	// 2) ctx.Deadline() (caller context deadline)

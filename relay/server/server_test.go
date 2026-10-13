@@ -8,6 +8,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gosuda/keyless_tls/internal/admission"
 	"github.com/gosuda/keyless_tls/internal/testutil"
 	"github.com/gosuda/keyless_tls/relay/signer"
 	"github.com/gosuda/keyless_tls/relay/signrpc"
@@ -232,4 +234,103 @@ func mustRSAKey(t *testing.T) *rsa.PrivateKey {
 		t.Fatalf("generate key: %v", err)
 	}
 	return priv
+}
+
+func validSignBody(t *testing.T) []byte {
+	t.Helper()
+	body, err := json.Marshal(signrpc.TranscriptSignRequest{
+		KeyID: "relay-cert", Algorithm: signrpc.AlgorithmRSAPSSSHA256,
+		Nonce: "nonce", TimestampUnix: time.Now().Unix(),
+		ClientHello: []byte("ch"), ServerHello: []byte("sh"),
+		EncryptedExtensions: []byte("ee"), Certificate: []byte("cert"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+func TestSignHandler_PerCertificateRateLimit(t *testing.T) {
+	h := signHandlerWithLimits(&signer.Service{Store: staticStore{signer: mustRSAKey(t)}},
+		admission.Limits{MaxConcurrent: 8, MaxPerIdentity: 2, MaxIdentities: 8, RatePerSecond: 1, Burst: 1})
+	body := validSignBody(t)
+	send := func(cert *x509.Certificate, address string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, signrpc.SignPath, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = address
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}}
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		return rr
+	}
+	certA := &x509.Certificate{Raw: []byte("client A")}
+	certB := &x509.Certificate{Raw: []byte("client B")}
+	if rr := send(certA, "192.0.2.1:123"); rr.Code != http.StatusOK {
+		t.Fatalf("initial signing status = %d: %s", rr.Code, rr.Body.String())
+	}
+	// Changing IP must not reset the mTLS identity's token bucket.
+	if rr := send(certA, "192.0.2.2:123"); rr.Code != http.StatusTooManyRequests ||
+		rr.Header().Get("Retry-After") != "1" {
+		t.Fatalf("identity rate limit status = %d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := send(certB, "192.0.2.2:123"); rr.Code != http.StatusOK {
+		t.Fatalf("independent client status = %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+type heldSigner struct {
+	public  crypto.PublicKey
+	entered chan struct{}
+	release <-chan struct{}
+}
+
+func (s *heldSigner) Public() crypto.PublicKey { return s.public }
+
+func (s *heldSigner) Sign(_ io.Reader, _ []byte, _ crypto.SignerOpts) ([]byte, error) {
+	s.entered <- struct{}{}
+	<-s.release
+	return []byte{1}, nil
+}
+
+func TestSignHandler_MapsSignerOverloadTo429(t *testing.T) {
+	release := make(chan struct{})
+	blocker := &heldSigner{public: mustRSAKey(t).Public(), entered: make(chan struct{}, 1), release: release}
+	svc := &signer.Service{
+		Store:                    staticStore{signer: blocker},
+		MaxConcurrentSigns:       1,
+		MaxConcurrentSignsPerKey: 1,
+	}
+	h := signHandler(svc)
+	body := validSignBody(t)
+	send := func(addr string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, signrpc.SignPath, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = addr
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		return rr
+	}
+	first := make(chan *httptest.ResponseRecorder, 1)
+	go func() { first <- send("192.0.2.1:1111") }()
+	select {
+	case <-blocker.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first sign operation did not start")
+	}
+	overloaded := send("192.0.2.2:2222")
+	if overloaded.Code != http.StatusTooManyRequests || overloaded.Header().Get("Retry-After") != "1" {
+		t.Fatalf("overload status = %d: %s", overloaded.Code, overloaded.Body.String())
+	}
+	if got := svc.RejectedSigns(); got != 1 {
+		t.Fatalf("overload metric = %d, want 1", got)
+	}
+	close(release)
+	select {
+	case result := <-first:
+		if result.Code != http.StatusOK {
+			t.Fatalf("first request status = %d: %s", result.Code, result.Body.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("admitted signing did not finish after releasing its slot")
+	}
 }

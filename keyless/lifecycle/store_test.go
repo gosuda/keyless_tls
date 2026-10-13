@@ -184,7 +184,9 @@ func TestDiskStoreRejectsSymlinkedDirectories(t *testing.T) {
 
 func TestDiskStoreRejectsUntrustedDirectoryPermissions(t *testing.T) {
 	t.Parallel()
-	if runtime.GOOS == "windows" {
+	switch runtime.GOOS {
+	case "aix", "darwin", "dragonfly", "freebsd", "linux", "netbsd", "openbsd", "solaris":
+	default:
 		t.Skip("Unix permission semantics required")
 	}
 

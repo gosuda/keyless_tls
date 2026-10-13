@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -128,6 +129,42 @@ func testHandshakeRecord(header, body []byte) []byte {
 	record[3] = byte(len(body) >> 8)
 	record[4] = byte(len(body))
 	return append(record, body...)
+}
+
+func TestInspectClientHelloBoundsRecordFragmentation(t *testing.T) {
+	record := captureClientHelloRecord(t, "fragmented.example.com", []string{"h2"})
+	body := record[tlsRecordHeaderLen:]
+	if len(body) <= maxClientHelloRecords {
+		t.Fatal("test ClientHello must exceed the record limit when split into single bytes")
+	}
+	for _, count := range []int{maxClientHelloRecords, maxClientHelloRecords + 1} {
+		t.Run(fmt.Sprintf("records_%d", count), func(t *testing.T) {
+			var payload []byte
+			for i := 0; i < count-1; i++ {
+				payload = append(payload, testHandshakeRecord(record[:tlsRecordHeaderLen], body[i:i+1])...)
+			}
+			payload = append(payload, testHandshakeRecord(record[:tlsRecordHeaderLen], body[count-1:])...)
+			client, server := net.Pipe()
+			defer client.Close()
+			defer server.Close()
+			go func() { _, _ = client.Write(payload) }()
+			info, replay, err := InspectClientHello(server, time.Second)
+			if count == maxClientHelloRecords {
+				if err != nil || info.ServerName != "fragmented.example.com" {
+					t.Fatalf("allowed fragmentation: name=%q, error=%v", info.ServerName, err)
+				}
+			} else if !errors.Is(err, ErrClientHelloTooLarge) {
+				t.Fatalf("excessive fragmentation error = %v, want ErrClientHelloTooLarge", err)
+			}
+			got := make([]byte, len(payload))
+			if _, err := io.ReadFull(replay, got); err != nil {
+				t.Fatalf("read replay: %v", err)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Fatal("fragmented record replay changed the byte stream")
+			}
+		})
+	}
 }
 
 func TestProxyAdmissionRejectsExcessConnections(t *testing.T) {

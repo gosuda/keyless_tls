@@ -362,7 +362,10 @@ These limits apply before routing and remain in force after routing. SDK users c
 `l4.Proxy.MaxConnections`, `MaxConnectionsPerIP`, and `IdleTimeout`. A zero value
 selects the same safe defaults; negative values are rejected by `Proxy.Serve`.
 The inspector rejects TLS handshake records larger than 16 KiB and bounds fragmented
-ClientHello inspection. Cancellation closes admitted connections and their upstreams.
+ClientHello inspection to 64 KiB of handshake data, 128 KiB of captured traffic,
+and 128 records. Inspection-limit errors are rejected before routing, including
+when parse-error fallback is enabled. Cancellation closes admitted connections
+and their upstreams.
 
 ### Example app: one relay routing 10 target hosts
 

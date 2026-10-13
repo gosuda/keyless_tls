@@ -22,6 +22,7 @@ const (
 	maxTLSPlaintextRecordLen = 1 << 14
 	maxClientHelloLen        = 64 << 10
 	maxClientHelloCaptureLen = 128 << 10
+	maxClientHelloRecords    = 128
 )
 
 var (
@@ -58,7 +59,10 @@ func InspectClientHello(conn net.Conn, timeout time.Duration) (ClientHelloInfo, 
 	captured := make([]byte, 0, 1024)
 	handshake := make([]byte, 0, 1024)
 
-	for {
+	for records := 0; ; records++ {
+		if records >= maxClientHelloRecords {
+			return helloWithAddrs(conn), prependConn(conn, captured), ErrClientHelloTooLarge
+		}
 		// Bound record overhead as well as the assembled handshake body.
 		if len(captured)+tlsRecordHeaderLen > maxClientHelloCaptureLen {
 			return helloWithAddrs(conn), prependConn(conn, captured), ErrClientHelloTooLarge

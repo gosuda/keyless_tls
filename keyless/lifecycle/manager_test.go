@@ -160,7 +160,7 @@ func newTestManager(t *testing.T, clock *testClock, requireChallenge bool) *Mana
 	t.Helper()
 
 	issuerCertPEM, issuerKeyPEM := issueTestCA(t, clock.Now().Add(-time.Hour), clock.Now().Add(365*24*time.Hour))
-	store, err := NewDiskStore(t.TempDir(), bytesRepeat(0x41, 32))
+	store, err := NewDiskStore(t.TempDir(), t.TempDir(), bytesRepeat(0x41, 32))
 	if err != nil {
 		t.Fatalf("create disk store: %v", err)
 	}

@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -135,6 +138,20 @@ func hashContentForAlgorithm(content []byte, algorithm string) ([]byte, error) {
 func signByAlgorithm(signer crypto.Signer, digest []byte, algorithm string) ([]byte, error) {
 	if signer == nil {
 		return nil, errors.New("signer is nil")
+	}
+
+	// The key, not the caller, determines which TLS signature scheme is allowed.
+	var compatible bool
+	switch pub := signer.Public().(type) {
+	case *ecdsa.PublicKey:
+		compatible = pub != nil && pub.Curve == elliptic.P256() && algorithm == signrpc.AlgorithmECDSASHA256
+	case *rsa.PublicKey:
+		compatible = pub != nil && algorithm == signrpc.AlgorithmRSAPSSSHA256
+	case ed25519.PublicKey:
+		compatible = len(pub) == ed25519.PublicKeySize && algorithm == signrpc.AlgorithmEd25519
+	}
+	if !compatible {
+		return nil, fmt.Errorf("algorithm %q is incompatible with signer public key", algorithm)
 	}
 
 	switch algorithm {

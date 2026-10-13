@@ -57,7 +57,7 @@ func TestSignerTLSHandshakeDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	conf, err := serverTLSConfig(certPEM, keyPEM, clientCA)
+	conf, err := serverTLSConfig(certPEM, keyPEM, clientCA, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestSignerSlowHTTPReads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	conf, err := serverTLSConfig(certPEM, keyPEM, nil)
+	conf, err := serverTLSConfig(certPEM, keyPEM, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestSignerIdleDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	conf, err := serverTLSConfig(certPEM, keyPEM, nil)
+	conf, err := serverTLSConfig(certPEM, keyPEM, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}

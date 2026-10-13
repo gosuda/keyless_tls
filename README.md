@@ -456,6 +456,31 @@ library's core guarantee, not one deployment's hardening choice.
 - Keep only the public certificate chain in tunnel apps
 - Enforce signer mTLS and pair it with `KeyID`-scoped ACLs
 
+### Lease identity rollback protection
+
+`NewDiskStore(dir, secret, authority)` requires a caller-supplied
+`RevisionAuthority`. This authority determines the committed epoch and
+SHA-256 digest of each encrypted lease revision. **Deploy it outside the lease
+filesystem's snapshot, backup/restore, and write-access trust boundary.** Its
+`LoadRevision` method must be a linearizable read, and `CommitRevision`
+must be a durable atomic compare-and-swap. A stale write must return
+`ErrStaleRevision`. The authority must never lose, reset, or roll back a
+previously committed lease head.
+
+The disk store writes an immutable authenticated blob and synchronizes it
+before committing its digest to the authority. Only the committed revision
+can be loaded. Replaying an older ciphertext, deleting the committed file,
+or losing access to the authority causes identity validation to fail closed.
+An in-memory map or another file within the same backup/write boundary
+is **not** a suitable production authority.
+
+**Migration:** This is a breaking constructor and on-disk format change.
+Existing single-file `*.lease` records are not automatically imported.
+Provision the authoritative store and reissue the identities through a trusted
+process. Preserve the authority during restart and disaster recovery; never
+restore an earlier authoritative head. Unreferenced revision files may be
+pruned only after verifying that none is the committed head.
+
 ### Signer API contract (`/v1/sign`)
 
 The signing protocol has a **single endpoint with a transcript-bound contract**. The request

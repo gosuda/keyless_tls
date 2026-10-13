@@ -13,7 +13,7 @@ func TestDiskStoreSaveLoadAndPerms(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	store, err := NewDiskStore(dir, repeatBytes(0x19, 32))
+	store, err := NewDiskStore(dir, repeatBytes(0x19, 32), newMemoryRevisionAuthority())
 	if err != nil {
 		t.Fatalf("new disk store: %v", err)
 	}
@@ -35,7 +35,11 @@ func TestDiskStoreSaveLoadAndPerms(t *testing.T) {
 		t.Fatalf("save state: %v", err)
 	}
 
-	path := store.pathForLease("lease-store")
+	revision, err := store.authority.LoadRevision(context.Background(), "lease-store")
+	if err != nil {
+		t.Fatalf("load revision: %v", err)
+	}
+	path := store.pathForRevision("lease-store", revision)
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat state file: %v", err)
@@ -60,7 +64,7 @@ func TestDiskStoreCorruptionMarking(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	store, err := NewDiskStore(dir, repeatBytes(0x29, 32))
+	store, err := NewDiskStore(dir, repeatBytes(0x29, 32), newMemoryRevisionAuthority())
 	if err != nil {
 		t.Fatalf("new disk store: %v", err)
 	}
@@ -72,7 +76,7 @@ func TestDiskStoreCorruptionMarking(t *testing.T) {
 			CertPEM:   []byte("cert"),
 			KeyPEM:    []byte("key"),
 			ChainPEM:  []byte("chain"),
-			Epoch:     3,
+			Epoch:     1,
 			NotBefore: time.Now().Add(-time.Minute),
 			NotAfter:  time.Now().Add(time.Hour),
 		},
@@ -82,7 +86,11 @@ func TestDiskStoreCorruptionMarking(t *testing.T) {
 		t.Fatalf("save state: %v", err)
 	}
 
-	path := store.pathForLease("lease-corrupt")
+	revision, err := store.authority.LoadRevision(context.Background(), "lease-corrupt")
+	if err != nil {
+		t.Fatalf("load revision: %v", err)
+	}
+	path := store.pathForRevision("lease-corrupt", revision)
 	if err := os.WriteFile(path, []byte("broken"), 0o600); err != nil {
 		t.Fatalf("overwrite file: %v", err)
 	}
@@ -98,10 +106,10 @@ func TestDiskStoreCorruptionMarking(t *testing.T) {
 func TestDiskStoreRequiresValidInputs(t *testing.T) {
 	t.Parallel()
 
-	if _, err := NewDiskStore("", repeatBytes(0x30, 32)); !errors.Is(err, ErrInvalidRequest) {
+	if _, err := NewDiskStore("", repeatBytes(0x30, 32), newMemoryRevisionAuthority()); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("expected invalid request for empty dir, got %v", err)
 	}
-	if _, err := NewDiskStore(t.TempDir(), []byte("short")); !errors.Is(err, ErrInvalidRequest) {
+	if _, err := NewDiskStore(t.TempDir(), []byte("short"), newMemoryRevisionAuthority()); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("expected invalid request for short key, got %v", err)
 	}
 }

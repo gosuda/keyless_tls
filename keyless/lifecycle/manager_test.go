@@ -160,7 +160,7 @@ func newTestManager(t *testing.T, clock *testClock, requireChallenge bool) *Mana
 	t.Helper()
 
 	issuerCertPEM, issuerKeyPEM := issueTestCA(t, clock.Now().Add(-time.Hour), clock.Now().Add(365*24*time.Hour))
-	store, err := NewDiskStore(t.TempDir(), bytesRepeat(0x41, 32))
+	store, err := NewDiskStore(t.TempDir(), bytesRepeat(0x41, 32), newMemoryRevisionAuthority())
 	if err != nil {
 		t.Fatalf("create disk store: %v", err)
 	}
@@ -248,4 +248,39 @@ func (c *testClock) Advance(d time.Duration) {
 	c.mu.Lock()
 	c.now = c.now.Add(d)
 	c.mu.Unlock()
+}
+
+func TestLifecycleRejectsRestoredCurrentAfterRenewal(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	clock := newTestClock(time.Now().UTC())
+	manager := newTestManager(t, clock, false)
+	issued, err := manager.IssueIdentity(ctx, "lease-restore", ChallengeProof{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := manager.cfg.Store.(*DiskStore)
+	oldRevision, err := store.authority.LoadRevision(ctx, "lease-restore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldBlob, err := os.ReadFile(store.pathForRevision("lease-restore", oldRevision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.RenewIdentity(ctx, "lease-restore"); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(3 * time.Minute)
+	newRevision, err := store.authority.LoadRevision(ctx, "lease-restore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.pathForRevision("lease-restore", newRevision), oldBlob, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ValidateIdentity("lease-restore", mustParseLeaf(t, issued.CertPEM)); !errors.Is(err, ErrCorruptStore) {
+		t.Fatalf("restored old current must be rejected, got %v", err)
+	}
 }

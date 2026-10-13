@@ -72,6 +72,7 @@ type ManagerConfig struct {
 type Manager struct {
 	cfg         ManagerConfig
 	issuerCert  *x509.Certificate
+	issuerRoots *x509.CertPool
 	issuerKey   crypto.Signer
 	issuerChain []byte
 
@@ -140,15 +141,21 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: parse issuer cert: %v", ErrInvalidRequest, err)
 	}
+	if !issuerValidAt(issuerCert, cfg.Now()) {
+		return nil, fmt.Errorf("%w: issuer certificate is not currently valid", ErrInvalidRequest)
+	}
 	issuerKey, err := parseSignerPEM(cfg.IssuerKeyPEM)
 	if err != nil {
 		return nil, fmt.Errorf("%w: parse issuer key: %v", ErrInvalidRequest, err)
 	}
 
+	roots := x509.NewCertPool()
+	roots.AddCert(issuerCert)
 	chain := append([]byte(nil), cfg.IssuerCertPEM...)
 	return &Manager{
 		cfg:         cfg,
 		issuerCert:  issuerCert,
+		issuerRoots: roots,
 		issuerKey:   issuerKey,
 		issuerChain: chain,
 		reissuedAt:  make(map[string]time.Time),
@@ -368,6 +375,22 @@ func (m *Manager) validateChallenge(ctx context.Context, leaseID string, proof C
 }
 
 func (m *Manager) issueBundleLocked(leaseID string, epoch int, metadata map[string]string, now time.Time) (IdentityBundle, error) {
+	if !issuerValidAt(m.issuerCert, now) {
+		return IdentityBundle{}, ErrInvalidCert
+	}
+	notBefore := now.Add(-time.Minute)
+	if notBefore.Before(m.issuerCert.NotBefore) {
+		notBefore = m.issuerCert.NotBefore
+	}
+	notAfter := now.Add(m.cfg.CertTTL)
+	if notAfter.After(m.issuerCert.NotAfter) {
+		notAfter = m.issuerCert.NotAfter
+	}
+	// X.509 encodes validity to whole seconds; require a usable lifetime.
+	if !notAfter.Truncate(time.Second).After(now) {
+		return IdentityBundle{}, ErrInvalidCert
+	}
+
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), m.cfg.Rand)
 	if err != nil {
 		return IdentityBundle{}, fmt.Errorf("generate key: %w", err)
@@ -381,8 +404,6 @@ func (m *Manager) issueBundleLocked(leaseID string, epoch int, metadata map[stri
 		return IdentityBundle{}, fmt.Errorf("build lease URI: %w", err)
 	}
 
-	notBefore := now.Add(-1 * time.Minute)
-	notAfter := now.Add(m.cfg.CertTTL)
 	template := &x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
@@ -423,26 +444,15 @@ func (m *Manager) issueBundleLocked(leaseID string, epoch int, metadata map[stri
 }
 
 func (m *Manager) validatePeerCert(leaseID string, cert *x509.Certificate, now time.Time) error {
-	if cert == nil {
+	if cert == nil || !issuerValidAt(m.issuerCert, now) {
 		return ErrInvalidCert
 	}
-	if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
+	if _, err := cert.Verify(x509.VerifyOptions{
+		Roots:       m.issuerRoots,
+		CurrentTime: now,
+		KeyUsages:   []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err != nil {
 		return ErrInvalidCert
-	}
-	if err := cert.CheckSignatureFrom(m.issuerCert); err != nil {
-		return ErrInvalidCert
-	}
-	if len(cert.ExtKeyUsage) > 0 {
-		hasClientAuth := false
-		for _, usage := range cert.ExtKeyUsage {
-			if usage == x509.ExtKeyUsageClientAuth {
-				hasClientAuth = true
-				break
-			}
-		}
-		if !hasClientAuth {
-			return ErrInvalidCert
-		}
 	}
 
 	certLeaseID := extractLeaseIDFromCert(cert)
@@ -507,6 +517,10 @@ func certEqual(a, b []byte) bool {
 	hashA := sha256.Sum256(a)
 	hashB := sha256.Sum256(b)
 	return subtle.ConstantTimeCompare(hashA[:], hashB[:]) == 1
+}
+
+func issuerValidAt(issuer *x509.Certificate, now time.Time) bool {
+	return !now.Before(issuer.NotBefore) && !now.After(issuer.NotAfter)
 }
 
 func parseLeafCertPEM(certPEM []byte) (*x509.Certificate, error) {

@@ -25,9 +25,9 @@ const (
 )
 
 var (
-	ErrNotTLSRecord   = errors.New("not a TLS handshake record")
-	ErrNotClientHello = errors.New("not a TLS ClientHello")
-	ErrTLSRecordTooLarge = errors.New("TLS handshake record exceeds 16384 bytes")
+	ErrNotTLSRecord        = errors.New("not a TLS handshake record")
+	ErrNotClientHello      = errors.New("not a TLS ClientHello")
+	ErrTLSRecordTooLarge   = errors.New("TLS handshake record exceeds 16384 bytes")
 	ErrClientHelloTooLarge = errors.New("TLS ClientHello exceeds inspection limit")
 )
 
@@ -112,6 +112,7 @@ func InspectClientHello(conn net.Conn, timeout time.Duration) (ClientHelloInfo, 
 		return info, prependConn(conn, captured), err
 	}
 }
+
 func parseClientHelloRecord(recordBody []byte) (ClientHelloInfo, error) {
 	if len(recordBody) < 4 {
 		return ClientHelloInfo{}, ErrNotClientHello

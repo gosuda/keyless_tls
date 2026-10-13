@@ -354,6 +354,15 @@ Useful `cmd/relay-l4` route-mode flags:
 - `-default-upstream`: fallback target for unknown visible SNI, including ECH outer SNI misses
 - `-allow-parse-error`: allow non-TLS/invalid ClientHello to use fallback
 - `-clienthello-timeout`: maximum ClientHello inspection time
+- `-max-connections`: simultaneous relay connection cap, including ClientHello inspection (default 1,024)
+- `-max-connections-per-ip`: simultaneous connections allowed from one source IP (default 64)
+- `-idle-timeout`: close established connections after this period without traffic in either direction (default 2 minutes)
+
+These limits apply before routing and remain in force after routing. SDK users can set
+`l4.Proxy.MaxConnections`, `MaxConnectionsPerIP`, and `IdleTimeout`. A zero value
+selects the same safe defaults; negative values are rejected by `Proxy.Serve`.
+The inspector rejects TLS handshake records larger than 16 KiB and bounds fragmented
+ClientHello inspection. Cancellation closes admitted connections and their upstreams.
 
 ### Example app: one relay routing 10 target hosts
 

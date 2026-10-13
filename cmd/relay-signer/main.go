@@ -33,7 +33,7 @@ func main() {
 		}
 		log.Println("WARNING: -client-ca not set and -allow-insecure-no-client-auth is enabled, mTLS client verification disabled")
 	}
-	log.Println("WARNING: no transcript validator is configured; any client that completes TLS client auth can obtain CertificateVerify signatures. Deployments that enforce binding semantics must run a signer with a TranscriptValidator.")
+	log.Println("WARNING: no transcript validator is configured; any client admitted by the signer transport can obtain CertificateVerify signatures. Deployments that enforce binding semantics must run a signer with a TranscriptValidator.")
 
 	certPEM := mustRead(*certPath)
 	keyPEM := mustRead(*keyPath)
@@ -57,10 +57,11 @@ func main() {
 	defer stop()
 
 	err = server.ListenAndServe(ctx, server.Config{
-		ListenAddr:    *listenAddr,
-		ServerCertPEM: certPEM,
-		ServerKeyPEM:  keyPEM,
-		ClientCAPEM:   caPEM,
+		ListenAddr:                *listenAddr,
+		ServerCertPEM:             certPEM,
+		ServerKeyPEM:              keyPEM,
+		ClientCAPEM:               caPEM,
+		AllowInsecureNoClientAuth: *allowInsecureNoClientAuth,
 		SignerService: &signer.Service{
 			Store: store,
 		},

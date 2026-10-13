@@ -239,14 +239,14 @@ func sanitizePathToken(value string) string {
 
 // openTrustedStoreRoot walks directory components through pinned os.Root handles.
 // It never follows symlinks or changes permissions on directories of unknown ownership.
-func openTrustedStoreRoot(absDir string) (root *os.Root, err error) {
+func openTrustedStoreRoot(absDir string) (result *os.Root, err error) {
 	volume := filepath.VolumeName(absDir)
 	base := volume + string(filepath.Separator)
 	if absDir == base {
 		return nil, errors.New("store path must not be a volume root")
 	}
 
-	root, err = os.OpenRoot(base)
+	root, err := os.OpenRoot(base)
 	if err != nil {
 		return nil, err
 	}

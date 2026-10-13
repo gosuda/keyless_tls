@@ -22,6 +22,10 @@ type Config struct {
 	ServerKeyPEM  []byte
 	ClientCAPEM   []byte
 	SignerService *signer.Service
+
+	// AllowInsecureNoClientAuth permits running without mTLS when ClientCAPEM
+	// is empty. Use only for isolated local demos, never for reachable signers.
+	AllowInsecureNoClientAuth bool
 }
 
 func ListenAndServe(ctx context.Context, cfg Config) error {
@@ -32,7 +36,7 @@ func ListenAndServe(ctx context.Context, cfg Config) error {
 		return errors.New("signer service is required")
 	}
 
-	tlsConf, err := serverTLSConfig(cfg.ServerCertPEM, cfg.ServerKeyPEM, cfg.ClientCAPEM)
+	tlsConf, err := serverTLSConfig(cfg.ServerCertPEM, cfg.ServerKeyPEM, cfg.ClientCAPEM, cfg.AllowInsecureNoClientAuth)
 	if err != nil {
 		return err
 	}
@@ -106,7 +110,11 @@ func writeJSONError(w http.ResponseWriter, code int, message string) {
 	_ = json.NewEncoder(w).Encode(signrpc.ErrorResponse{Error: message})
 }
 
-func serverTLSConfig(certPEM, keyPEM, clientCAPEM []byte) (*tls.Config, error) {
+func serverTLSConfig(certPEM, keyPEM, clientCAPEM []byte, allowInsecureNoClientAuth bool) (*tls.Config, error) {
+	if len(clientCAPEM) == 0 && !allowInsecureNoClientAuth {
+		return nil, errors.New("client CA PEM is required (AllowInsecureNoClientAuth is for insecure demos only)")
+	}
+
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		return nil, fmt.Errorf("parse server key pair: %w", err)
@@ -115,17 +123,17 @@ func serverTLSConfig(certPEM, keyPEM, clientCAPEM []byte) (*tls.Config, error) {
 	tlsConf := &tls.Config{
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{cert},
-		ClientAuth:   tls.NoClientCert, // overridden below when client CA is provided
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+	}
+	if len(clientCAPEM) == 0 {
+		tlsConf.ClientAuth = tls.NoClientCert
+		return tlsConf, nil
 	}
 
-	if len(clientCAPEM) > 0 {
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(clientCAPEM) {
-			return nil, errors.New("failed to parse client CA PEM")
-		}
-		tlsConf.ClientAuth = tls.RequireAndVerifyClientCert
-		tlsConf.ClientCAs = pool
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(clientCAPEM) {
+		return nil, errors.New("failed to parse client CA PEM")
 	}
-
+	tlsConf.ClientCAs = pool
 	return tlsConf, nil
 }

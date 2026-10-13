@@ -57,11 +57,12 @@ func main() {
 	defer stop()
 
 	err = server.ListenAndServe(ctx, server.Config{
-		ListenAddr:    *listenAddr,
-		ServerCertPEM: certPEM,
-		ServerKeyPEM:  keyPEM,
-		ClientCAPEM:   caPEM,
-		SignerService: &signer.Service{
+		ListenAddr:                *listenAddr,
+		ServerCertPEM:             certPEM,
+		ServerKeyPEM:              keyPEM,
+		ClientCAPEM:               caPEM,
+		AllowInsecureNoClientAuth: *allowInsecureNoClientAuth,
+		SignerService:              &signer.Service{
 			Store: store,
 		},
 	})

@@ -8,6 +8,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -31,7 +32,7 @@ func TestServerTLSConfig_WithMTLS(t *testing.T) {
 		t.Fatalf("create client CA cert: %v", err)
 	}
 
-	tlsConf, err := serverTLSConfig(serverCertPEM, serverKeyPEM, clientCAPEM)
+	tlsConf, err := serverTLSConfig(serverCertPEM, serverKeyPEM, clientCAPEM, false)
 	if err != nil {
 		t.Fatalf("serverTLSConfig() error = %v", err)
 	}
@@ -43,13 +44,99 @@ func TestServerTLSConfig_WithMTLS(t *testing.T) {
 	}
 }
 
-func TestServerTLSConfig_WithoutMTLS(t *testing.T) {
+func TestServerTLSConfig_RequiresClientCA(t *testing.T) {
 	serverCertPEM, serverKeyPEM, err := testutil.GenerateCert("test.local", false)
 	if err != nil {
 		t.Fatalf("create server cert: %v", err)
 	}
 
-	tlsConf, err := serverTLSConfig(serverCertPEM, serverKeyPEM, nil)
+	_, err = serverTLSConfig(serverCertPEM, serverKeyPEM, nil, false)
+	if err == nil || !strings.Contains(err.Error(), "client CA PEM is required") {
+		t.Fatalf("expected missing client CA error, got %v", err)
+	}
+}
+
+func TestListenAndServe_RequiresClientCA(t *testing.T) {
+	serverCertPEM, serverKeyPEM, err := testutil.GenerateCert("test.local", false)
+	if err != nil {
+		t.Fatalf("create server cert: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Prevent a regression from leaving a listener running.
+	err = ListenAndServe(ctx, Config{
+		ListenAddr:    "127.0.0.1:0",
+		ServerCertPEM: serverCertPEM,
+		ServerKeyPEM:  serverKeyPEM,
+		SignerService: &signer.Service{Store: staticStore{signer: mustRSAKey(t)}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "client CA PEM is required") {
+		t.Fatalf("expected startup to reject missing client CA, got %v", err)
+	}
+}
+
+func TestSignServer_RejectsUnauthenticatedClient(t *testing.T) {
+	serverCertPEM, serverKeyPEM, err := testutil.GenerateCert("test.local", false)
+	if err != nil {
+		t.Fatalf("create server cert: %v", err)
+	}
+	clientCAPEM, _, err := testutil.GenerateCert("client.local", true)
+	if err != nil {
+		t.Fatalf("create client CA cert: %v", err)
+	}
+	tlsConf, err := serverTLSConfig(serverCertPEM, serverKeyPEM, clientCAPEM, false)
+	if err != nil {
+		t.Fatalf("serverTLSConfig() error = %v", err)
+	}
+
+	ts := httptest.NewUnstartedServer(signHandler(&signer.Service{
+		Store: staticStore{signer: mustRSAKey(t)},
+	}))
+	ts.TLS = tlsConf
+	ts.StartTLS()
+	defer ts.Close()
+
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(serverCertPEM) {
+		t.Fatal("failed to trust server certificate")
+	}
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS13,
+			RootCAs:    roots,
+			ServerName: "test.local",
+		}},
+	}
+	body, err := json.Marshal(signrpc.TranscriptSignRequest{
+		KeyID:               "relay-cert",
+		Algorithm:           signrpc.AlgorithmRSAPSSSHA256,
+		Binding:             []byte{0x01},
+		ClientHello:         []byte("client-hello"),
+		ServerHello:         []byte("server-hello"),
+		EncryptedExtensions: []byte("encrypted-extensions"),
+		Certificate:         []byte("certificate"),
+		TimestampUnix:       time.Now().Unix(),
+		Nonce:               "unauthenticated-client",
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	resp, err := client.Post(ts.URL+signrpc.SignPath, "application/json", bytes.NewReader(body))
+	if err == nil {
+		resp.Body.Close()
+		t.Fatalf("unauthenticated client reached /v1/sign: HTTP %d", resp.StatusCode)
+	}
+}
+
+func TestServerTLSConfig_ExplicitInsecureMode(t *testing.T) {
+	serverCertPEM, serverKeyPEM, err := testutil.GenerateCert("test.local", false)
+	if err != nil {
+		t.Fatalf("create server cert: %v", err)
+	}
+
+	tlsConf, err := serverTLSConfig(serverCertPEM, serverKeyPEM, nil, true)
 	if err != nil {
 		t.Fatalf("serverTLSConfig() error = %v", err)
 	}
@@ -67,7 +154,7 @@ func TestServerTLSConfig_InvalidCAPEM(t *testing.T) {
 		t.Fatalf("create server cert: %v", err)
 	}
 
-	_, err = serverTLSConfig(serverCertPEM, serverKeyPEM, []byte("not-valid-pem"))
+	_, err = serverTLSConfig(serverCertPEM, serverKeyPEM, []byte("not-valid-pem"), false)
 	if err == nil {
 		t.Fatal("expected error for invalid client CA PEM")
 	}

@@ -9,27 +9,27 @@ import (
 const idleRetention = time.Minute
 
 type Limits struct {
-	MaxConcurrent int
+	MaxConcurrent  int
 	MaxPerIdentity int
-	MaxIdentities int
-	RatePerSecond int
-	Burst int
+	MaxIdentities  int
+	RatePerSecond  int
+	Burst          int
 }
 
 type identityState struct {
 	active int
 	tokens float64
-	last time.Time
+	last   time.Time
 }
 
 // Limiter is safe for concurrent use. Every successful TryAcquire must be
 // paired with exactly one Release using the same identity.
 type Limiter struct {
-	mu sync.Mutex
-	limits Limits
-	active int
+	mu         sync.Mutex
+	limits     Limits
+	active     int
 	identities map[string]*identityState
-	rejected uint64
+	rejected   uint64
 }
 
 func New(limits Limits) *Limiter {
@@ -39,7 +39,7 @@ func New(limits Limits) *Limiter {
 		panic("admission: invalid limits")
 	}
 	return &Limiter{
-		limits: limits,
+		limits:     limits,
 		identities: make(map[string]*identityState),
 	}
 }
@@ -71,7 +71,7 @@ func (l *Limiter) TryAcquire(identity string) bool {
 		}
 		state = &identityState{
 			tokens: float64(l.limits.Burst),
-			last: now,
+			last:   now,
 		}
 		l.identities[identity] = state
 	}

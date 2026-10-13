@@ -74,6 +74,7 @@ type Manager struct {
 	issuerCert  *x509.Certificate
 	issuerKey   crypto.Signer
 	issuerChain []byte
+	issuerRoots *x509.CertPool
 
 	mu         sync.Mutex
 	reissuedAt map[string]time.Time
@@ -144,13 +145,19 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: parse issuer key: %v", ErrInvalidRequest, err)
 	}
+	if err := checkIssuerValidity(issuerCert, cfg.Now()); err != nil {
+		return nil, err
+	}
 
+	roots := x509.NewCertPool()
+	roots.AddCert(issuerCert)
 	chain := append([]byte(nil), cfg.IssuerCertPEM...)
 	return &Manager{
 		cfg:         cfg,
 		issuerCert:  issuerCert,
 		issuerKey:   issuerKey,
 		issuerChain: chain,
+		issuerRoots: roots,
 		reissuedAt:  make(map[string]time.Time),
 	}, nil
 }
@@ -368,6 +375,17 @@ func (m *Manager) validateChallenge(ctx context.Context, leaseID string, proof C
 }
 
 func (m *Manager) issueBundleLocked(leaseID string, epoch int, metadata map[string]string, now time.Time) (IdentityBundle, error) {
+	if err := checkIssuerValidity(m.issuerCert, now); err != nil {
+		return IdentityBundle{}, err
+	}
+	notAfter := now.Add(m.cfg.CertTTL).Truncate(time.Second)
+	if notAfter.After(m.issuerCert.NotAfter) {
+		notAfter = m.issuerCert.NotAfter
+	}
+	if !notAfter.After(now) {
+		return IdentityBundle{}, fmt.Errorf("%w: issuer has insufficient remaining lifetime", ErrInvalidCert)
+	}
+
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), m.cfg.Rand)
 	if err != nil {
 		return IdentityBundle{}, fmt.Errorf("generate key: %w", err)
@@ -382,7 +400,6 @@ func (m *Manager) issueBundleLocked(leaseID string, epoch int, metadata map[stri
 	}
 
 	notBefore := now.Add(-1 * time.Minute)
-	notAfter := now.Add(m.cfg.CertTTL)
 	template := &x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
@@ -422,27 +439,26 @@ func (m *Manager) issueBundleLocked(leaseID string, epoch int, metadata map[stri
 	}, nil
 }
 
+func checkIssuerValidity(cert *x509.Certificate, now time.Time) error {
+	if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
+		return fmt.Errorf("%w: issuer certificate outside validity window", ErrInvalidCert)
+	}
+	return nil
+}
+
 func (m *Manager) validatePeerCert(leaseID string, cert *x509.Certificate, now time.Time) error {
 	if cert == nil {
 		return ErrInvalidCert
 	}
-	if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
-		return ErrInvalidCert
+	if err := checkIssuerValidity(m.issuerCert, now); err != nil {
+		return err
 	}
-	if err := cert.CheckSignatureFrom(m.issuerCert); err != nil {
+	if _, err := cert.Verify(x509.VerifyOptions{
+		Roots:       m.issuerRoots,
+		CurrentTime: now,
+		KeyUsages:   []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err != nil {
 		return ErrInvalidCert
-	}
-	if len(cert.ExtKeyUsage) > 0 {
-		hasClientAuth := false
-		for _, usage := range cert.ExtKeyUsage {
-			if usage == x509.ExtKeyUsageClientAuth {
-				hasClientAuth = true
-				break
-			}
-		}
-		if !hasClientAuth {
-			return ErrInvalidCert
-		}
 	}
 
 	certLeaseID := extractLeaseIDFromCert(cert)

@@ -1,0 +1,26 @@
+name: Go
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.2'
+      - name: Check formatting
+        run: |
+          test -z "$(gofmt -l keyless/lifecycle/store.go keyless/lifecycle/store_test.go keyless/lifecycle/store_dir_*.go)"
+      - name: Test with race detector
+        run: go test -race ./...
+      - name: Vet
+        run: go vet ./...

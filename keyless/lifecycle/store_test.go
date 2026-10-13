@@ -2,14 +2,14 @@ package lifecycle
 
 import (
 	"context"
-	"errors"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
-	"path/filepath"
-	"sync"
+	"errors"
 	"os"
+	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 )

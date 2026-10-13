@@ -12,26 +12,54 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
+
+// ErrStaleRevision means another writer committed a newer lease revision.
+var ErrStaleRevision = errors.New("stale lease revision")
 
 type Store interface {
 	Save(ctx context.Context, state *leaseState) error
 	Load(ctx context.Context, leaseID string) (*leaseState, error)
 }
 
-type DiskStore struct {
-	dir  string
-	aead cipher.AEAD
+// LeaseRevision identifies the exact committed ciphertext for an identity.
+// Epoch zero and the zero digest represent an identity not yet issued.
+type LeaseRevision struct {
+	Epoch  int
+	Digest [sha256.Size]byte
 }
 
-func NewDiskStore(dir string, secret []byte) (*DiskStore, error) {
+// RevisionAuthority is the authoritative, durable lease head registry.
+//
+// Implementations must store revisions outside the lease directory's backup and
+// write-access boundary. LoadRevision must be linearizable and return
+// ErrLeaseNotFound for unissued identities. CommitRevision must atomically and
+// durably replace expected with next, reject mismatches with ErrStaleRevision,
+// and never permit a previously committed epoch to be reused or rolled back.
+// All DiskStore instances sharing a lease must use the same authority.
+type RevisionAuthority interface {
+	LoadRevision(ctx context.Context, leaseID string) (LeaseRevision, error)
+	CommitRevision(ctx context.Context, leaseID string, expected, next LeaseRevision) error
+}
+
+type DiskStore struct {
+	dir       string
+	aead      cipher.AEAD
+	authority RevisionAuthority
+}
+
+func NewDiskStore(dir string, secret []byte, authority RevisionAuthority) (*DiskStore, error) {
 	dir = strings.TrimSpace(dir)
 	if dir == "" {
 		return nil, fmt.Errorf("%w: keyless dir is required", ErrInvalidRequest)
 	}
 	if len(secret) != 32 {
 		return nil, fmt.Errorf("%w: secret must be 32 bytes", ErrInvalidRequest)
+	}
+	if authority == nil {
+		return nil, fmt.Errorf("%w: revision authority is required", ErrInvalidRequest)
 	}
 
 	block, err := aes.NewCipher(secret)
@@ -50,13 +78,10 @@ func NewDiskStore(dir string, secret []byte) (*DiskStore, error) {
 		return nil, fmt.Errorf("lock keyless dir perms: %w", err)
 	}
 
-	return &DiskStore{
-		dir:  dir,
-		aead: aead,
-	}, nil
+	return &DiskStore{dir: dir, aead: aead, authority: authority}, nil
 }
 
-func (d *DiskStore) Save(_ context.Context, state *leaseState) error {
+func (d *DiskStore) Save(ctx context.Context, state *leaseState) error {
 	if state == nil {
 		return fmt.Errorf("%w: state is required", ErrInvalidRequest)
 	}
@@ -67,75 +92,123 @@ func (d *DiskStore) Save(_ context.Context, state *leaseState) error {
 	if normalizeLeaseID(state.Current.LeaseID) != leaseID {
 		return fmt.Errorf("%w: current lease id mismatch", ErrInvalidRequest)
 	}
+	if state.Current.Epoch < 1 {
+		return fmt.Errorf("%w: current epoch must be positive", ErrInvalidRequest)
+	}
 
-	path := d.pathForLease(leaseID)
-	temp := path + ".tmp"
+	expected, err := d.authority.LoadRevision(ctx, leaseID)
+	if errors.Is(err, ErrLeaseNotFound) {
+		expected = LeaseRevision{}
+	} else if err != nil {
+		return fmt.Errorf("load lease revision: %w", err)
+	}
+	if state.Current.Epoch != expected.Epoch+1 {
+		return ErrStaleRevision
+	}
+
 	payload, err := json.Marshal(state)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal lease state: %w", err)
 	}
 	nonce := make([]byte, d.aead.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return err
+		return fmt.Errorf("generate lease nonce: %w", err)
 	}
 	ciphertext := d.aead.Seal(nil, nonce, payload, nil)
 	blob := append(nonce, ciphertext...)
+	next := LeaseRevision{Epoch: state.Current.Epoch, Digest: sha256.Sum256(blob)}
+	path := d.pathForRevision(leaseID, next)
 
-	file, err := os.OpenFile(temp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	// Each candidate has a unique name. Failed CAS writers cannot overwrite
+	// the committed blob, and an uncommitted candidate is never loaded.
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		return err
+		return fmt.Errorf("create lease revision: %w", err)
 	}
 	if _, err := file.Write(blob); err != nil {
 		_ = file.Close()
-		return err
+		_ = os.Remove(path)
+		return fmt.Errorf("write lease revision: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return fmt.Errorf("sync lease revision: %w", err)
 	}
 	if err := file.Close(); err != nil {
-		return err
+		_ = os.Remove(path)
+		return fmt.Errorf("close lease revision: %w", err)
 	}
-	if err := os.Rename(temp, path); err != nil {
-		_ = os.Remove(temp)
-		return err
+	if err := syncRevisionDirectory(d.dir); err != nil {
+		_ = os.Remove(path)
+		return fmt.Errorf("sync lease directory: %w", err)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return err
+
+	// Publishing the authoritative head is the linearization point. On an
+	// ambiguous authority failure the candidate must be retained: removing
+	// it could remove a revision that actually committed.
+	if err := d.authority.CommitRevision(ctx, leaseID, expected, next); err != nil {
+		if errors.Is(err, ErrStaleRevision) {
+			_ = os.Remove(path)
+		}
+		return fmt.Errorf("commit lease revision: %w", err)
 	}
 	return nil
 }
 
-func (d *DiskStore) Load(_ context.Context, leaseID string) (*leaseState, error) {
+// The authority must not commit a blob whose directory entry is uncommitted.
+// Windows does not support synchronizing a directory through os.File.Sync;
+// after a crash, missing state still fails closed.
+func syncRevisionDirectory(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	file, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return file.Sync()
+}
+
+func (d *DiskStore) Load(ctx context.Context, leaseID string) (*leaseState, error) {
 	leaseID = normalizeLeaseID(leaseID)
 	if leaseID == "" {
 		return nil, ErrInvalidLeaseID
 	}
-	path := d.pathForLease(leaseID)
-	blob, err := os.ReadFile(path)
+	revision, err := d.authority.LoadRevision(ctx, leaseID)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, ErrLeaseNotFound
-		}
 		return nil, err
 	}
-	nonceSize := d.aead.NonceSize()
-	if len(blob) <= nonceSize {
+	if revision.Epoch < 1 || revision.Digest == ([sha256.Size]byte{}) {
+		return nil, fmt.Errorf("%w: invalid committed lease revision", ErrCorruptStore)
+	}
+
+	path := d.pathForRevision(leaseID, revision)
+	blob, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("%w: read committed lease revision: %v", ErrCorruptStore, err)
+	}
+	if sha256.Sum256(blob) != revision.Digest {
+		return nil, d.markCorrupt(path, errors.New("committed lease digest mismatch"))
+	}
+	if len(blob) <= d.aead.NonceSize() {
 		return nil, d.markCorrupt(path, errors.New("payload truncated"))
 	}
 
-	nonce := blob[:nonceSize]
-	ciphertext := blob[nonceSize:]
-	plaintext, err := d.aead.Open(nil, nonce, ciphertext, nil)
+	plaintext, err := d.aead.Open(nil, blob[:d.aead.NonceSize()], blob[d.aead.NonceSize():], nil)
 	if err != nil {
 		return nil, d.markCorrupt(path, err)
 	}
-
 	var state leaseState
 	if err := json.Unmarshal(plaintext, &state); err != nil {
 		return nil, d.markCorrupt(path, err)
 	}
-	if normalizeLeaseID(state.LeaseID) != leaseID {
+	if normalizeLeaseID(state.LeaseID) != leaseID || normalizeLeaseID(state.Current.LeaseID) != leaseID {
 		return nil, d.markCorrupt(path, errors.New("lease id mismatch"))
 	}
-	if normalizeLeaseID(state.Current.LeaseID) != leaseID {
-		return nil, d.markCorrupt(path, errors.New("current lease id mismatch"))
+	if state.Current.Epoch != revision.Epoch {
+		return nil, d.markCorrupt(path, errors.New("lease epoch mismatch"))
 	}
 	return &state, nil
 }
@@ -145,6 +218,10 @@ func (d *DiskStore) markCorrupt(path string, cause error) error {
 	_ = os.Remove(corruptPath)
 	_ = os.Rename(path, corruptPath)
 	return fmt.Errorf("%w: %v", ErrCorruptStore, cause)
+}
+
+func (d *DiskStore) pathForRevision(leaseID string, revision LeaseRevision) string {
+	return fmt.Sprintf("%s.%d.%x", d.pathForLease(leaseID), revision.Epoch, revision.Digest)
 }
 
 func (d *DiskStore) pathForLease(leaseID string) string {

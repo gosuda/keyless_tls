@@ -6,12 +6,14 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -22,6 +24,7 @@ type Store interface {
 
 type DiskStore struct {
 	dir  string
+	root *os.Root
 	aead cipher.AEAD
 }
 
@@ -43,17 +46,21 @@ func NewDiskStore(dir string, secret []byte) (*DiskStore, error) {
 		return nil, fmt.Errorf("create gcm: %w", err)
 	}
 
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("create keyless dir: %w", err)
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("lock keyless dir perms: %w", err)
+	root, err := openPrivateStoreDirectory(dir)
+	if err != nil {
+		return nil, fmt.Errorf("open keyless dir: %w", err)
 	}
 
 	return &DiskStore{
 		dir:  dir,
+		root: root,
 		aead: aead,
 	}, nil
+}
+
+// Close releases the pinned directory handle. Do not use the store after Close.
+func (d *DiskStore) Close() error {
+	return d.root.Close()
 }
 
 func (d *DiskStore) Save(_ context.Context, state *leaseState) error {
@@ -68,8 +75,7 @@ func (d *DiskStore) Save(_ context.Context, state *leaseState) error {
 		return fmt.Errorf("%w: current lease id mismatch", ErrInvalidRequest)
 	}
 
-	path := d.pathForLease(leaseID)
-	temp := path + ".tmp"
+	name := leaseFileName(leaseID)
 	payload, err := json.Marshal(state)
 	if err != nil {
 		return err
@@ -81,23 +87,63 @@ func (d *DiskStore) Save(_ context.Context, state *leaseState) error {
 	ciphertext := d.aead.Seal(nil, nonce, payload, nil)
 	blob := append(nonce, ciphertext...)
 
-	file, err := os.OpenFile(temp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	var suffix [16]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return fmt.Errorf("generate temporary filename: %w", err)
+	}
+	tempName := ".lease-" + hex.EncodeToString(suffix[:]) + ".tmp"
+	file, err := d.root.OpenFile(tempName, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		return err
+		return fmt.Errorf("create temporary lease: %w", err)
+	}
+	defer d.root.Remove(tempName)
+
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return fmt.Errorf("stat temporary lease: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		_ = file.Close()
+		return fmt.Errorf("temporary lease is not a regular file")
+	}
+	if err := validateStoreOwner(info); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("temporary lease owner: %w", err)
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("set temporary lease permissions: %w", err)
 	}
 	if _, err := file.Write(blob); err != nil {
 		_ = file.Close()
-		return err
+		return fmt.Errorf("write temporary lease: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("sync temporary lease: %w", err)
 	}
 	if err := file.Close(); err != nil {
-		return err
+		return fmt.Errorf("close temporary lease: %w", err)
 	}
-	if err := os.Rename(temp, path); err != nil {
-		_ = os.Remove(temp)
-		return err
+	if err := d.root.Rename(tempName, name); err != nil {
+		return fmt.Errorf("install lease: %w", err)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return err
+
+	// Persist the rename, not only the file contents. Windows does not support
+	// syncing directory handles through os.File.Sync.
+	if runtime.GOOS != "windows" {
+		directory, err := d.root.Open(".")
+		if err != nil {
+			return fmt.Errorf("open keyless dir for sync: %w", err)
+		}
+		if err := directory.Sync(); err != nil {
+			_ = directory.Close()
+			return fmt.Errorf("sync keyless dir: %w", err)
+		}
+		if err := directory.Close(); err != nil {
+			return fmt.Errorf("close keyless dir after sync: %w", err)
+		}
 	}
 	return nil
 }
@@ -107,8 +153,8 @@ func (d *DiskStore) Load(_ context.Context, leaseID string) (*leaseState, error)
 	if leaseID == "" {
 		return nil, ErrInvalidLeaseID
 	}
-	path := d.pathForLease(leaseID)
-	blob, err := os.ReadFile(path)
+	name := leaseFileName(leaseID)
+	blob, err := d.root.ReadFile(name)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, ErrLeaseNotFound
@@ -117,40 +163,44 @@ func (d *DiskStore) Load(_ context.Context, leaseID string) (*leaseState, error)
 	}
 	nonceSize := d.aead.NonceSize()
 	if len(blob) <= nonceSize {
-		return nil, d.markCorrupt(path, errors.New("payload truncated"))
+		return nil, d.markCorrupt(name, errors.New("payload truncated"))
 	}
 
 	nonce := blob[:nonceSize]
 	ciphertext := blob[nonceSize:]
 	plaintext, err := d.aead.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
-		return nil, d.markCorrupt(path, err)
+		return nil, d.markCorrupt(name, err)
 	}
 
 	var state leaseState
 	if err := json.Unmarshal(plaintext, &state); err != nil {
-		return nil, d.markCorrupt(path, err)
+		return nil, d.markCorrupt(name, err)
 	}
 	if normalizeLeaseID(state.LeaseID) != leaseID {
-		return nil, d.markCorrupt(path, errors.New("lease id mismatch"))
+		return nil, d.markCorrupt(name, errors.New("lease id mismatch"))
 	}
 	if normalizeLeaseID(state.Current.LeaseID) != leaseID {
-		return nil, d.markCorrupt(path, errors.New("current lease id mismatch"))
+		return nil, d.markCorrupt(name, errors.New("current lease id mismatch"))
 	}
 	return &state, nil
 }
 
-func (d *DiskStore) markCorrupt(path string, cause error) error {
-	corruptPath := path + ".corrupt"
-	_ = os.Remove(corruptPath)
-	_ = os.Rename(path, corruptPath)
+func (d *DiskStore) markCorrupt(name string, cause error) error {
+	corruptName := name + ".corrupt"
+	_ = d.root.Remove(corruptName)
+	_ = d.root.Rename(name, corruptName)
 	return fmt.Errorf("%w: %v", ErrCorruptStore, cause)
 }
 
 func (d *DiskStore) pathForLease(leaseID string) string {
+	return filepath.Join(d.dir, leaseFileName(leaseID))
+}
+
+func leaseFileName(leaseID string) string {
 	base := sanitizePathToken(leaseID)
 	hash := sha256.Sum256([]byte(leaseID))
-	return filepath.Join(d.dir, fmt.Sprintf("%s-%x.lease", base, hash[:4]))
+	return fmt.Sprintf("%s-%x.lease", base, hash[:4])
 }
 
 func sanitizePathToken(value string) string {

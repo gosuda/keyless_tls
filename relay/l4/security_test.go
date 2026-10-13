@@ -39,6 +39,39 @@ func TestInspectClientHelloRejectsOversizedRecordBeforeBody(t *testing.T) {
 	}
 }
 
+func TestProxyRejectsOversizedRecordWithoutDialing(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+
+	dialed := make(chan struct{}, 1)
+	done := make(chan struct{})
+	p := &Proxy{
+		DialByClientHello: func(context.Context, ClientHelloInfo, error) (net.Conn, error) {
+			dialed <- struct{}{}
+			return nil, nil
+		},
+	}
+	go func() {
+		p.handleConn(context.Background(), server)
+		close(done)
+	}()
+
+	_, err := client.Write([]byte{tlsContentTypeHandshake, 3, 3, 0xff, 0xff})
+	if err != nil {
+		t.Fatalf("write oversized record header: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("proxy did not reject oversized record")
+	}
+	select {
+	case <-dialed:
+		t.Fatal("proxy forwarded oversized record to dial callback")
+	default:
+	}
+}
+
 func TestInspectClientHelloReassemblesFragmentedHandshake(t *testing.T) {
 	record := captureClientHelloRecord(t, "split.example.com", []string{"h2"})
 	body := record[tlsRecordHeaderLen:]

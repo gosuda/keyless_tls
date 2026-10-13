@@ -1,0 +1,22 @@
+name: Go tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Lifecycle race tests
+        run: go test -race ./keyless/lifecycle
+      - name: Full test suite
+        run: go test ./...

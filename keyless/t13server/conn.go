@@ -169,6 +169,17 @@ func (c *Conn) doHandshake(ctx context.Context) error {
 		return err
 	}
 
+	// The admission decision happens before reading ClientHello, key exchange
+	// or remote signing. Excess work fails immediately without a waiting queue.
+	source := sourceIdentity(c.raw)
+	if !c.server.sourceRates.Allow(source, time.Now()) {
+		return ErrHandshakeOverloaded
+	}
+	if !c.server.handshakes.TryAcquire(source) {
+		return ErrHandshakeOverloaded
+	}
+	defer c.server.handshakes.Release(source)
+
 	// Compute effective handshake deadline as the earliest applicable limit among:
 	// 1) c.handshakeTimeout (configured maximum duration)
 	// 2) ctx.Deadline() (caller context deadline)

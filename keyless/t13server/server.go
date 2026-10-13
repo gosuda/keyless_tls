@@ -14,6 +14,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/gosuda/keyless_tls/internal/admission"
 	"github.com/gosuda/keyless_tls/relay/signrpc"
 )
 
@@ -36,6 +37,12 @@ type Config struct {
 	TranscriptSigner TranscriptSigner
 	// HandshakeTimeout is the maximum duration allowed for the TLS handshake. Defaults to 10s.
 	HandshakeTimeout time.Duration
+	// Admission limits apply before ClientHello parsing or remote signing.
+	// Zero values select safe defaults.
+	MaxConcurrentHandshakes      int
+	MaxConcurrentHandshakesPerIP int
+	HandshakeRatePerIP           int
+	HandshakeBurstPerIP          int
 }
 
 type Server struct {
@@ -43,6 +50,36 @@ type Server struct {
 
 	sigScheme uint16
 	sigAlg    string
+
+	handshakes  *admission.Concurrency
+	sourceRates *admission.Buckets
+}
+
+var ErrHandshakeOverloaded = errors.New("handshake capacity exceeded")
+
+const (
+	defaultMaxConcurrentHandshakes      = 64
+	defaultMaxConcurrentHandshakesPerIP = 4
+	defaultHandshakeRatePerIP           = 32
+	defaultHandshakeBurstPerIP          = 64
+	maxTrackedHandshakeSources          = 4096
+)
+
+// RejectedHandshakes reports concurrency and source-rate admission rejections.
+func (s *Server) RejectedHandshakes() uint64 {
+	return s.handshakes.Rejected() + s.sourceRates.Rejected()
+}
+
+func sourceIdentity(raw net.Conn) string {
+	remote := raw.RemoteAddr()
+	if remote == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(remote.String())
+	if err != nil {
+		return remote.String()
+	}
+	return host
 }
 
 func NewServer(cfg Config) (*Server, error) {
@@ -58,6 +95,26 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 	if cfg.TranscriptSigner == nil {
 		return nil, errors.New("transcript signer is required")
+	}
+	if cfg.MaxConcurrentHandshakes < 0 || cfg.MaxConcurrentHandshakesPerIP < 0 ||
+		cfg.HandshakeRatePerIP < 0 || cfg.HandshakeBurstPerIP < 0 {
+		return nil, errors.New("handshake admission limits must be non-negative")
+	}
+	total := cfg.MaxConcurrentHandshakes
+	if total == 0 {
+		total = defaultMaxConcurrentHandshakes
+	}
+	perIP := cfg.MaxConcurrentHandshakesPerIP
+	if perIP == 0 {
+		perIP = defaultMaxConcurrentHandshakesPerIP
+	}
+	rate := cfg.HandshakeRatePerIP
+	if rate == 0 {
+		rate = defaultHandshakeRatePerIP
+	}
+	burst := cfg.HandshakeBurstPerIP
+	if burst == 0 {
+		burst = defaultHandshakeBurstPerIP
 	}
 
 	leaf, err := x509.ParseCertificate(cfg.Certificates[0])
@@ -78,9 +135,11 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 
 	return &Server{
-		cfg:       cfg,
-		sigScheme: scheme,
-		sigAlg:    alg,
+		cfg:         cfg,
+		sigScheme:   scheme,
+		sigAlg:      alg,
+		handshakes:  admission.NewConcurrency(total, perIP),
+		sourceRates: admission.NewBuckets(rate, burst, maxTrackedHandshakeSources),
 	}, nil
 }
 

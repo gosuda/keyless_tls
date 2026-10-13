@@ -20,6 +20,36 @@ This repository supports two usage modes:
 
 ---
 
+## Signing and handshake admission control
+
+Both public handshakes and private-key signing use fail-fast admission limits.
+Rejected requests do not wait in an unbounded queue. The defaults apply even
+when callers use zero-valued configuration fields:
+
+| Layer | Concurrent work | Rate |
+| --- | --- | --- |
+| `signer.Service` | 32 signatures globally, 8 per key | Enforced by HTTP layer |
+| `relay/server` `/v1/sign` | 64 requests globally, 4 per authenticated client identity | 64 requests/second per identity, burst 64 |
+| `t13server.Server` | 64 handshakes globally, 4 per source IP | 32 handshakes/second per IP, burst 64 |
+
+The HTTP endpoint returns **429 Too Many Requests** with `Retry-After: 1`
+when limits are exceeded. TLS connections fail with
+`t13server.ErrHandshakeOverloaded` before they request a signature.
+`signer.Service.RejectedSignatures()` and
+`t13server.Server.RejectedHandshakes()` expose overload counters.
+Per-identity rate-limit tables are bounded to 4,096 entries, with eviction
+of identities idle for at least one minute when the table is full.
+
+Adjust `signer.Service.MaxConcurrentSigns` and
+`MaxConcurrentSignsPerKey`, `relay/server.Config` request limits, and
+`t13server.Config` handshake limits to match signing hardware and expected
+traffic. Zero fields use the documented defaults. Configure these values
+before serving traffic. **Retain signer-side limits** even when the TLS
+listener already has admission controls: a canceled request cannot interrupt
+an HSM operation already running inside `crypto.Signer.Sign`.
+
+---
+
 ## 1) Using the SDK library
 
 ### Core concept

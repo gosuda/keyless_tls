@@ -9,8 +9,10 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
+	"github.com/gosuda/keyless_tls/internal/admission"
 	"github.com/gosuda/keyless_tls/relay/signrpc"
 )
 
@@ -18,6 +20,7 @@ var (
 	ErrInvalidArgument  = errors.New("invalid argument")
 	ErrPermissionDenied = errors.New("permission denied")
 	ErrInternal         = errors.New("internal")
+	ErrOverloaded       = errors.New("signing capacity exceeded")
 )
 
 type TranscriptValidator interface {
@@ -42,6 +45,38 @@ type Service struct {
 	Store               KeyStore
 	AllowedSkew         time.Duration
 	TranscriptValidator TranscriptValidator
+	// Zero values use defaults. Configure before serving requests; do not
+	// modify these limits concurrently with SignTranscript.
+	MaxConcurrentSigns       int
+	MaxConcurrentSignsPerKey int
+
+	limitOnce sync.Once
+	limit     *admission.Concurrency
+}
+
+const (
+	defaultMaxConcurrentSigns       = 32
+	defaultMaxConcurrentSignsPerKey = 8
+)
+
+func (s *Service) signingLimit() *admission.Concurrency {
+	s.limitOnce.Do(func() {
+		total := s.MaxConcurrentSigns
+		if total <= 0 {
+			total = defaultMaxConcurrentSigns
+		}
+		perKey := s.MaxConcurrentSignsPerKey
+		if perKey <= 0 {
+			perKey = defaultMaxConcurrentSignsPerKey
+		}
+		s.limit = admission.NewConcurrency(total, perKey)
+	})
+	return s.limit
+}
+
+// RejectedSignatures reports requests refused due to concurrent signing limits.
+func (s *Service) RejectedSignatures() uint64 {
+	return s.signingLimit().Rejected()
 }
 
 func (s *Service) SignTranscript(ctx context.Context, req *signrpc.TranscriptSignRequest) (*signrpc.TranscriptSignResponse, error) {
@@ -66,6 +101,17 @@ func (s *Service) SignTranscript(ctx context.Context, req *signrpc.TranscriptSig
 	if req.TimestampUnix < now-int64(skew.Seconds()) || req.TimestampUnix > now+int64(skew.Seconds()) {
 		return nil, fmt.Errorf("%w: request timestamp outside allowed skew", ErrInvalidArgument)
 	}
+
+	// No queue: reject before validation, key-store access or HSM signing.
+	// Retain the slot until Sign returns, even if the caller cancels.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	limit := s.signingLimit()
+	if !limit.TryAcquire(req.KeyID) {
+		return nil, ErrOverloaded
+	}
+	defer limit.Release(req.KeyID)
 
 	if s.TranscriptValidator != nil {
 		if err := s.TranscriptValidator.ValidateTranscript(ctx, req); err != nil {

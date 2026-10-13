@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gosuda/keyless_tls/internal/admission"
 	"github.com/gosuda/keyless_tls/relay/signer"
 	"github.com/gosuda/keyless_tls/relay/signrpc"
 )
@@ -22,6 +24,11 @@ type Config struct {
 	ServerKeyPEM  []byte
 	ClientCAPEM   []byte
 	SignerService *signer.Service
+	// Zero uses the default. Configure limits before starting the server.
+	RequestsPerSecondPerIdentity     int
+	RequestBurstPerIdentity          int
+	MaxConcurrentRequests            int
+	MaxConcurrentRequestsPerIdentity int
 }
 
 func ListenAndServe(ctx context.Context, cfg Config) error {
@@ -30,6 +37,10 @@ func ListenAndServe(ctx context.Context, cfg Config) error {
 	}
 	if cfg.SignerService == nil {
 		return errors.New("signer service is required")
+	}
+	if cfg.RequestsPerSecondPerIdentity < 0 || cfg.RequestBurstPerIdentity < 0 ||
+		cfg.MaxConcurrentRequests < 0 || cfg.MaxConcurrentRequestsPerIdentity < 0 {
+		return errors.New("signer request rate limits must be non-negative")
 	}
 
 	tlsConf, err := serverTLSConfig(cfg.ServerCertPEM, cfg.ServerKeyPEM, cfg.ClientCAPEM)
@@ -43,7 +54,10 @@ func ListenAndServe(ctx context.Context, cfg Config) error {
 	}
 	tlsLis := tls.NewListener(lis, tlsConf)
 
-	httpServer := &http.Server{Handler: signHandler(cfg.SignerService)}
+	httpServer := &http.Server{
+		Handler:           signHandlerWithLimits(cfg.SignerService, cfg.RequestsPerSecondPerIdentity, cfg.RequestBurstPerIdentity, cfg.MaxConcurrentRequests, cfg.MaxConcurrentRequestsPerIdentity),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 
 	go func() {
 		<-ctx.Done()
@@ -55,7 +69,33 @@ func ListenAndServe(ctx context.Context, cfg Config) error {
 	return httpServer.Serve(tlsLis)
 }
 
+const (
+	defaultRequestsPerSecondPerIdentity = 64
+	defaultRequestBurstPerIdentity      = 64
+	maxTrackedIdentities                = 4096
+	defaultMaxConcurrentRequests        = 64
+	defaultMaxConcurrentRequestsPerID   = 4
+)
+
 func signHandler(service *signer.Service) http.Handler {
+	return signHandlerWithLimits(service, 0, 0, 0, 0)
+}
+
+func signHandlerWithLimits(service *signer.Service, perSecond, burst, maxConcurrent, maxPerID int) http.Handler {
+	if perSecond <= 0 {
+		perSecond = defaultRequestsPerSecondPerIdentity
+	}
+	if burst <= 0 {
+		burst = defaultRequestBurstPerIdentity
+	}
+	if maxConcurrent <= 0 {
+		maxConcurrent = defaultMaxConcurrentRequests
+	}
+	if maxPerID <= 0 {
+		maxPerID = defaultMaxConcurrentRequestsPerID
+	}
+	rateLimit := admission.NewBuckets(perSecond, burst, maxTrackedIdentities)
+	concurrency := admission.NewConcurrency(maxConcurrent, maxPerID)
 	mux := http.NewServeMux()
 	mux.HandleFunc(signrpc.SignPath, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -68,6 +108,21 @@ func signHandler(service *signer.Service) http.Handler {
 			writeJSONError(w, http.StatusUnsupportedMediaType, "content type must be application/json")
 			return
 		}
+
+		// The peer certificate, when available, is the authenticated identity.
+		// In non-mTLS mode all requests share one anonymous rate limit.
+		identity := requestIdentity(r)
+		if !rateLimit.Allow(identity, time.Now()) {
+			w.Header().Set("Retry-After", "1")
+			writeJSONError(w, http.StatusTooManyRequests, "signing request rate exceeded")
+			return
+		}
+		if !concurrency.TryAcquire(identity) {
+			w.Header().Set("Retry-After", "1")
+			writeJSONError(w, http.StatusTooManyRequests, "signing request concurrency exceeded")
+			return
+		}
+		defer concurrency.Release(identity)
 
 		r.Body = http.MaxBytesReader(w, r.Body, 512<<10) // 512 KiB for full cert chains and handshake fragments
 		defer r.Body.Close()
@@ -85,6 +140,9 @@ func signHandler(service *signer.Service) http.Handler {
 				status = http.StatusBadRequest
 			case errors.Is(err, signer.ErrPermissionDenied):
 				status = http.StatusForbidden
+			case errors.Is(err, signer.ErrOverloaded):
+				status = http.StatusTooManyRequests
+				w.Header().Set("Retry-After", "1")
 			}
 			writeJSONError(w, status, err.Error())
 			return
@@ -98,6 +156,14 @@ func signHandler(service *signer.Service) http.Handler {
 	})
 
 	return mux
+}
+
+func requestIdentity(r *http.Request) string {
+	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+		return "anonymous"
+	}
+	hash := sha256.Sum256(r.TLS.PeerCertificates[0].Raw)
+	return string(hash[:])
 }
 
 func writeJSONError(w http.ResponseWriter, code int, message string) {

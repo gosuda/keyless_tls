@@ -1,0 +1,26 @@
+name: Go checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: |
+          files="$(gofmt -l $(git ls-files '*.go'))"
+          test -z "$files" || { printf 'Unformatted Go files:\n%s\n' "$files"; exit 1; }

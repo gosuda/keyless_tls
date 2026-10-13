@@ -1,4 +1,4 @@
-//go:build linux || darwin || freebsd || netbsd || openbsd || dragonfly
+//go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
 
 package lifecycle
 

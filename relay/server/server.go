@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gosuda/keyless_tls/internal/admission"
 	"github.com/gosuda/keyless_tls/relay/signer"
 	"github.com/gosuda/keyless_tls/relay/signrpc"
 )
@@ -22,6 +25,39 @@ type Config struct {
 	ServerKeyPEM  []byte
 	ClientCAPEM   []byte
 	SignerService *signer.Service
+
+	// Per-mTLS-certificate request controls; zero selects the defaults.
+	MaxConcurrentRequestsPerClient int
+	RequestsPerClientPerSecond     int
+	ClientBurst                    int
+}
+
+const (
+	defaultMaxClientConcurrency = 4
+	defaultClientRate = 20
+	defaultClientBurst = 40
+)
+
+func clientLimits(cfg Config) admission.Limits {
+	concurrent := cfg.MaxConcurrentRequestsPerClient
+	if concurrent == 0 {
+		concurrent = defaultMaxClientConcurrency
+	}
+	rate := cfg.RequestsPerClientPerSecond
+	if rate == 0 {
+		rate = defaultClientRate
+	}
+	burst := cfg.ClientBurst
+	if burst == 0 {
+		burst = defaultClientBurst
+	}
+	return admission.Limits{
+		MaxConcurrent: 128,
+		MaxPerIdentity: concurrent,
+		MaxIdentities: 4096,
+		RatePerSecond: rate,
+		Burst: burst,
+	}
 }
 
 func ListenAndServe(ctx context.Context, cfg Config) error {
@@ -30,6 +66,9 @@ func ListenAndServe(ctx context.Context, cfg Config) error {
 	}
 	if cfg.SignerService == nil {
 		return errors.New("signer service is required")
+	}
+	if cfg.MaxConcurrentRequestsPerClient < 0 || cfg.RequestsPerClientPerSecond < 0 || cfg.ClientBurst < 0 {
+		return errors.New("client admission limits must not be negative")
 	}
 
 	tlsConf, err := serverTLSConfig(cfg.ServerCertPEM, cfg.ServerKeyPEM, cfg.ClientCAPEM)
@@ -43,7 +82,7 @@ func ListenAndServe(ctx context.Context, cfg Config) error {
 	}
 	tlsLis := tls.NewListener(lis, tlsConf)
 
-	httpServer := &http.Server{Handler: signHandler(cfg.SignerService)}
+	httpServer := &http.Server{Handler: signHandlerWithLimits(cfg.SignerService, clientLimits(cfg))}
 
 	go func() {
 		<-ctx.Done()
@@ -56,6 +95,11 @@ func ListenAndServe(ctx context.Context, cfg Config) error {
 }
 
 func signHandler(service *signer.Service) http.Handler {
+	return signHandlerWithLimits(service, clientLimits(Config{}))
+}
+
+func signHandlerWithLimits(service *signer.Service, limits admission.Limits) http.Handler {
+	clients := admission.New(limits)
 	mux := http.NewServeMux()
 	mux.HandleFunc(signrpc.SignPath, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -68,6 +112,14 @@ func signHandler(service *signer.Service) http.Handler {
 			writeJSONError(w, http.StatusUnsupportedMediaType, "content type must be application/json")
 			return
 		}
+
+		identity := clientIdentity(r)
+		if !clients.TryAcquire(identity) {
+			w.Header().Set("Retry-After", "1")
+			writeJSONError(w, http.StatusTooManyRequests, "client signing rate or concurrency limit exceeded")
+			return
+		}
+		defer clients.Release(identity)
 
 		r.Body = http.MaxBytesReader(w, r.Body, 512<<10) // 512 KiB for full cert chains and handshake fragments
 		defer r.Body.Close()
@@ -85,6 +137,9 @@ func signHandler(service *signer.Service) http.Handler {
 				status = http.StatusBadRequest
 			case errors.Is(err, signer.ErrPermissionDenied):
 				status = http.StatusForbidden
+			case errors.Is(err, signer.ErrOverloaded):
+				status = http.StatusTooManyRequests
+				w.Header().Set("Retry-After", "1")
 			}
 			writeJSONError(w, status, err.Error())
 			return
@@ -98,6 +153,20 @@ func signHandler(service *signer.Service) http.Handler {
 	})
 
 	return mux
+}
+
+// Identify authenticated clients by certificate, not an attacker-controlled HTTP
+// header. In explicit no-mTLS/demo mode, apply the same policy per source IP.
+func clientIdentity(r *http.Request) string {
+	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		sum := sha256.Sum256(r.TLS.PeerCertificates[0].Raw)
+		return "cert:" + hex.EncodeToString(sum[:])
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return "ip:" + host
+	}
+	return "ip:" + r.RemoteAddr
 }
 
 func writeJSONError(w http.ResponseWriter, code int, message string) {

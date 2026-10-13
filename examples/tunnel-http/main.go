@@ -44,12 +44,19 @@ func main() {
 		clientCertPath = flag.String("client-cert", "", "client cert PEM path for signer mTLS")
 		clientKeyPath  = flag.String("client-key", "", "client key PEM path for signer mTLS")
 		rootCAPath     = flag.String("root-ca", "", "signer root CA PEM path")
+		maxHandshakes = flag.Int("max-handshakes", 64, "maximum concurrent TLS handshakes")
+		maxPerSource = flag.Int("max-handshakes-per-source", 8, "maximum concurrent handshakes per source IP")
+		handshakeRate = flag.Int("handshake-rate", 20, "per-source handshake rate per second")
+		handshakeBurst = flag.Int("handshake-burst", 40, "per-source handshake burst")
 	)
 	flag.Parse()
 
 	required(*certPath, "cert")
 	required(*signerAddr, "signer-addr")
 	required(*signerName, "signer-name")
+	if *maxHandshakes <= 0 || *maxPerSource <= 0 || *handshakeRate <= 0 || *handshakeBurst <= 0 {
+		log.Fatal("handshake admission limits must be positive")
+	}
 
 	certPEM := mustRead(*certPath)
 	remoteSignerCfg := keyless.RemoteSignerConfig{
@@ -77,6 +84,10 @@ func main() {
 		CertPEM:          certPEM,
 		KeyID:            *keyID,
 		TranscriptSigner: rSigner,
+		MaxConcurrentHandshakes: *maxHandshakes,
+		MaxHandshakesPerSource: *maxPerSource,
+		HandshakesPerSourcePerSecond: *handshakeRate,
+		HandshakeBurstPerSource: *handshakeBurst,
 	})
 	if err != nil {
 		log.Fatalf("create keyless tls server: %v", err)

@@ -450,6 +450,30 @@ Consumers own the policy:
 A generic arbitrary-digest signing endpoint is deliberately absent: transcript binding is the
 library's core guarantee, not one deployment's hardening choice.
 
+## Lease identity authorization
+
+`keyless/lifecycle.NewManager` requires a `LeaseAuthorizer`. It calls
+`AuthorizeLease(ctx, leaseID, operation, proof)` before issuing, loading,
+renewing, or reissuing any lease identity, including before returning a
+private key. `LoadIdentity` and `RenewIdentity` now take a
+`lifecycle.ChallengeProof` argument, as the issue and reissue methods do.
+
+Implement the authorizer at the application's trusted authentication boundary:
+
+- Derive the principal from authenticated, trusted context rather than the supplied lease ID.
+- Bind each proof to that principal, the normalized lease ID, and the requested `LeaseOperation`.
+- Verify a fresh nonce and reject replay of previously accepted proofs.
+- Require possession of the current credential or an explicit recovery authorization before renewal or reissuance.
+
+A nonempty proof is necessary but **not sufficient**. The library deliberately
+delegates proof verification and tenant policy to the authorizer. Rejections
+are returned as `ErrChallengeRequired` or `ErrChallengeRejected`, without
+revealing internal authorization details.
+
+`NewTrustedManager` explicitly bypasses these checks. Use it only inside a
+fully trusted coordinator with unrestricted authority over every lease in
+its store. It must not be exposed to tenant-controlled requests.
+
 ## Security and operations notes
 
 - Store private keys only in `relay-signer`; never distribute them to tunnel apps

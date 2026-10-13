@@ -456,6 +456,28 @@ library's core guarantee, not one deployment's hardening choice.
 - Keep only the public certificate chain in tunnel apps
 - Enforce signer mTLS and pair it with `KeyID`-scoped ACLs
 
+### Lifecycle lease rollback protection
+
+`lifecycle.NewDiskStore(leaseDir, authorityDir, secret)` requires a separate,
+authoritative checkpoint directory. Every saved encrypted lease is bound to its
+current epoch and ciphertext digest. Loading an older blob, or a blob without a
+matching checkpoint, fails closed with `ErrCorruptStore`. A stale competing
+writer fails with `ErrStaleEpoch`.
+
+The two directories must have **different trust and recovery boundaries**.
+The checkpoint directory must not be writable or restorable by an actor who
+can replace the encrypted lease files. Keep it outside lease backup/snapshot
+restore sets and protect it with an independent trusted storage authority,
+access control, or anti-rollback facility. Merely choosing two directories on
+the same filesystem does **not** protect against an administrator who can
+replace both. Losing a checkpoint intentionally prevents reactivation of
+stored credentials; restore only from an authenticated authoritative record
+or re-enroll the identity through a trusted process.
+
+The disk store uses advisory interprocess locks and durable rename/fsync
+operations for transactions. Deploy on a filesystem honoring those guarantees.
+The implementation fails closed on platforms without supported locking.
+
 ### Signer API contract (`/v1/sign`)
 
 The signing protocol has a **single endpoint with a transcript-bound contract**. The request

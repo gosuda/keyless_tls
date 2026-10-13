@@ -18,11 +18,18 @@ const (
 	extALPN                  = 16
 	extEncryptedClientHello  = 0xfe0d
 	defaultInspectTimeout    = 2 * time.Second
+	// Handshake records are plaintext and must not exceed 2^14 bytes.
+	maxTLSPlaintextRecordLen = 1 << 14
+	maxClientHelloLen        = 64 << 10
+	maxClientHelloCaptureLen = 128 << 10
+	maxClientHelloRecords    = 128
 )
 
 var (
-	ErrNotTLSRecord   = errors.New("not a TLS handshake record")
-	ErrNotClientHello = errors.New("not a TLS ClientHello")
+	ErrNotTLSRecord        = errors.New("not a TLS handshake record")
+	ErrNotClientHello      = errors.New("not a TLS ClientHello")
+	ErrTLSRecordTooLarge   = errors.New("TLS handshake record exceeds 16384 bytes")
+	ErrClientHelloTooLarge = errors.New("TLS ClientHello exceeds inspection limit")
 )
 
 type ClientHelloInfo struct {
@@ -50,29 +57,64 @@ func InspectClientHello(conn net.Conn, timeout time.Duration) (ClientHelloInfo, 
 	}()
 
 	captured := make([]byte, 0, 1024)
+	handshake := make([]byte, 0, 1024)
 
-	header := make([]byte, tlsRecordHeaderLen)
-	if err := readFullCapture(conn, header, &captured); err != nil {
-		return helloWithAddrs(conn), prependConn(conn, captured), fmt.Errorf("read TLS record header: %w", err)
-	}
-	if header[0] != tlsContentTypeHandshake {
-		return helloWithAddrs(conn), prependConn(conn, captured), ErrNotTLSRecord
-	}
+	for records := 0; ; records++ {
+		if records >= maxClientHelloRecords {
+			return helloWithAddrs(conn), prependConn(conn, captured), ErrClientHelloTooLarge
+		}
+		// Bound record overhead as well as the assembled handshake body.
+		if len(captured)+tlsRecordHeaderLen > maxClientHelloCaptureLen {
+			return helloWithAddrs(conn), prependConn(conn, captured), ErrClientHelloTooLarge
+		}
 
-	recordLen := int(header[3])<<8 | int(header[4])
-	if recordLen == 0 {
-		return helloWithAddrs(conn), prependConn(conn, captured), ErrNotClientHello
-	}
+		var header [tlsRecordHeaderLen]byte
+		if err := readFullCapture(conn, header[:], &captured); err != nil {
+			return helloWithAddrs(conn), prependConn(conn, captured), fmt.Errorf("read TLS record header: %w", err)
+		}
+		if header[0] != tlsContentTypeHandshake {
+			return helloWithAddrs(conn), prependConn(conn, captured), ErrNotTLSRecord
+		}
 
-	recordBody := make([]byte, recordLen)
-	if err := readFullCapture(conn, recordBody, &captured); err != nil {
-		return helloWithAddrs(conn), prependConn(conn, captured), fmt.Errorf("read TLS record body: %w", err)
-	}
+		recordLen := int(header[3])<<8 | int(header[4])
+		if recordLen == 0 {
+			return helloWithAddrs(conn), prependConn(conn, captured), ErrNotClientHello
+		}
+		if recordLen > maxTLSPlaintextRecordLen {
+			return helloWithAddrs(conn), prependConn(conn, captured), ErrTLSRecordTooLarge
+		}
+		if len(captured)+recordLen > maxClientHelloCaptureLen || len(handshake)+recordLen > maxClientHelloLen {
+			return helloWithAddrs(conn), prependConn(conn, captured), ErrClientHelloTooLarge
+		}
 
-	helloInfo, err := parseClientHelloRecord(recordBody)
-	helloInfo.ClientAddr = conn.RemoteAddr()
-	helloInfo.LocalAddr = conn.LocalAddr()
-	return helloInfo, prependConn(conn, captured), err
+		body := make([]byte, recordLen)
+		if err := readFullCapture(conn, body, &captured); err != nil {
+			return helloWithAddrs(conn), prependConn(conn, captured), fmt.Errorf("read TLS record body: %w", err)
+		}
+		handshake = append(handshake, body...)
+		if len(handshake) < 4 {
+			continue
+		}
+		if handshake[0] != tlsHandshakeTypeClientHi {
+			return helloWithAddrs(conn), prependConn(conn, captured), ErrNotClientHello
+		}
+
+		msgLen := int(handshake[1])<<16 | int(handshake[2])<<8 | int(handshake[3])
+		if msgLen == 0 {
+			return helloWithAddrs(conn), prependConn(conn, captured), ErrNotClientHello
+		}
+		if 4+msgLen > maxClientHelloLen {
+			return helloWithAddrs(conn), prependConn(conn, captured), ErrClientHelloTooLarge
+		}
+		if len(handshake) < 4+msgLen {
+			continue
+		}
+
+		info, err := parseClientHelloRecord(handshake)
+		info.ClientAddr = conn.RemoteAddr()
+		info.LocalAddr = conn.LocalAddr()
+		return info, prependConn(conn, captured), err
+	}
 }
 
 func parseClientHelloRecord(recordBody []byte) (ClientHelloInfo, error) {
@@ -260,4 +302,11 @@ func (c *preloadedConn) Read(p []byte) (int, error) {
 		return c.prefix.Read(p)
 	}
 	return c.Conn.Read(p)
+}
+
+func (c *preloadedConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }

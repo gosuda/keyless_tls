@@ -52,8 +52,21 @@ type ChallengeProof struct {
 	Token string `json:"token"`
 }
 
-type ChallengeValidator interface {
-	ValidateChallenge(ctx context.Context, leaseID string, proof ChallengeProof) error
+// LeaseOperation identifies the credential operation being authorized.
+type LeaseOperation string
+
+const (
+	OperationIssue   LeaseOperation = "issue"
+	OperationLoad    LeaseOperation = "load"
+	OperationRenew   LeaseOperation = "renew"
+	OperationReissue LeaseOperation = "reissue"
+)
+
+// LeaseAuthorizer must authenticate the caller from trusted context and verify
+// a single-use proof bound to the caller, lease ID, and operation. Renewal and
+// reissuance must require current-key possession or explicit recovery authority.
+type LeaseAuthorizer interface {
+	AuthorizeLease(ctx context.Context, leaseID string, operation LeaseOperation, proof ChallengeProof) error
 }
 
 type ManagerConfig struct {
@@ -63,8 +76,7 @@ type ManagerConfig struct {
 	CertTTL          time.Duration
 	OverlapGrace     time.Duration
 	ReissueMinPeriod time.Duration
-	RequireChallenge bool
-	Validator        ChallengeValidator
+	Authorizer        LeaseAuthorizer
 	Now              func() time.Time
 	Rand             io.Reader
 }
@@ -74,6 +86,7 @@ type Manager struct {
 	issuerCert  *x509.Certificate
 	issuerKey   crypto.Signer
 	issuerChain []byte
+	trusted     bool
 
 	mu         sync.Mutex
 	reissuedAt map[string]time.Time
@@ -104,7 +117,25 @@ type leaseState struct {
 	UpdatedAt          time.Time       `json:"updated_at"`
 }
 
+// NewManager requires an authorizer for every private-key read and write.
 func NewManager(cfg ManagerConfig) (*Manager, error) {
+	return newManager(cfg, false)
+}
+
+// NewTrustedManager deliberately skips authorization. Use it only in a fully
+// trusted coordinator whose callers already control every lease in the store.
+func NewTrustedManager(cfg ManagerConfig) (*Manager, error) {
+	return newManager(cfg, true)
+}
+
+func newManager(cfg ManagerConfig, trusted bool) (*Manager, error) {
+	if trusted {
+		if cfg.Authorizer != nil {
+			return nil, fmt.Errorf("%w: trusted manager must not have an authorizer", ErrInvalidRequest)
+		}
+	} else if cfg.Authorizer == nil {
+		return nil, fmt.Errorf("%w: lease authorizer is required", ErrInvalidRequest)
+	}
 	if cfg.Store == nil {
 		return nil, fmt.Errorf("%w: store is required", ErrInvalidRequest)
 	}
@@ -151,6 +182,7 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 		issuerCert:  issuerCert,
 		issuerKey:   issuerKey,
 		issuerChain: chain,
+		trusted:     trusted,
 		reissuedAt:  make(map[string]time.Time),
 	}, nil
 }
@@ -160,7 +192,7 @@ func (m *Manager) IssueIdentity(ctx context.Context, leaseID string, proof Chall
 	if leaseID == "" {
 		return nil, ErrInvalidLeaseID
 	}
-	if err := m.validateChallenge(ctx, leaseID, proof); err != nil {
+	if err := m.authorizeLease(ctx, leaseID, OperationIssue, proof); err != nil {
 		return nil, err
 	}
 
@@ -196,10 +228,13 @@ func (m *Manager) IssueIdentity(ctx context.Context, leaseID string, proof Chall
 	return &bundle, nil
 }
 
-func (m *Manager) LoadIdentity(ctx context.Context, leaseID string) (*IdentityBundle, error) {
+func (m *Manager) LoadIdentity(ctx context.Context, leaseID string, proof ChallengeProof) (*IdentityBundle, error) {
 	leaseID = normalizeLeaseID(leaseID)
 	if leaseID == "" {
 		return nil, ErrInvalidLeaseID
+	}
+	if err := m.authorizeLease(ctx, leaseID, OperationLoad, proof); err != nil {
+		return nil, err
 	}
 
 	m.mu.Lock()
@@ -213,10 +248,13 @@ func (m *Manager) LoadIdentity(ctx context.Context, leaseID string) (*IdentityBu
 	return &bundle, nil
 }
 
-func (m *Manager) RenewIdentity(ctx context.Context, leaseID string) (*IdentityBundle, error) {
+func (m *Manager) RenewIdentity(ctx context.Context, leaseID string, proof ChallengeProof) (*IdentityBundle, error) {
 	leaseID = normalizeLeaseID(leaseID)
 	if leaseID == "" {
 		return nil, ErrInvalidLeaseID
+	}
+	if err := m.authorizeLease(ctx, leaseID, OperationRenew, proof); err != nil {
+		return nil, err
 	}
 
 	m.mu.Lock()
@@ -252,7 +290,7 @@ func (m *Manager) ReissueIdentity(ctx context.Context, leaseID string, proof Cha
 	if leaseID == "" {
 		return nil, ErrInvalidLeaseID
 	}
-	if err := m.validateChallenge(ctx, leaseID, proof); err != nil {
+	if err := m.authorizeLease(ctx, leaseID, OperationReissue, proof); err != nil {
 		return nil, err
 	}
 
@@ -351,18 +389,15 @@ func (m *Manager) ValidateIdentity(leaseID string, peerCert *x509.Certificate) (
 	return nil, ErrLeaseMismatch
 }
 
-func (m *Manager) validateChallenge(ctx context.Context, leaseID string, proof ChallengeProof) error {
-	if !m.cfg.RequireChallenge {
+func (m *Manager) authorizeLease(ctx context.Context, leaseID string, operation LeaseOperation, proof ChallengeProof) error {
+	if m.trusted {
 		return nil
 	}
 	if strings.TrimSpace(proof.Nonce) == "" || strings.TrimSpace(proof.Token) == "" {
 		return ErrChallengeRequired
 	}
-	if m.cfg.Validator == nil {
+	if err := m.cfg.Authorizer.AuthorizeLease(ctx, leaseID, operation, proof); err != nil {
 		return ErrChallengeRejected
-	}
-	if err := m.cfg.Validator.ValidateChallenge(ctx, leaseID, proof); err != nil {
-		return fmt.Errorf("%w: %v", ErrChallengeRejected, err)
 	}
 	return nil
 }

@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -22,6 +23,7 @@ type Store interface {
 
 type DiskStore struct {
 	dir  string
+	root *os.Root
 	aead cipher.AEAD
 }
 
@@ -43,17 +45,25 @@ func NewDiskStore(dir string, secret []byte) (*DiskStore, error) {
 		return nil, fmt.Errorf("create gcm: %w", err)
 	}
 
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("create keyless dir: %w", err)
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve keyless dir: %w", err)
 	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("lock keyless dir perms: %w", err)
+	root, err := openTrustedStoreRoot(absDir)
+	if err != nil {
+		return nil, fmt.Errorf("secure keyless dir: %w", err)
 	}
 
 	return &DiskStore{
-		dir:  dir,
+		dir:  absDir,
+		root: root,
 		aead: aead,
 	}, nil
+}
+
+// Close releases the pinned store directory. The store must not be used after Close.
+func (d *DiskStore) Close() error {
+	return d.root.Close()
 }
 
 func (d *DiskStore) Save(_ context.Context, state *leaseState) error {
@@ -68,8 +78,7 @@ func (d *DiskStore) Save(_ context.Context, state *leaseState) error {
 		return fmt.Errorf("%w: current lease id mismatch", ErrInvalidRequest)
 	}
 
-	path := d.pathForLease(leaseID)
-	temp := path + ".tmp"
+	name := filepath.Base(d.pathForLease(leaseID))
 	payload, err := json.Marshal(state)
 	if err != nil {
 		return err
@@ -81,23 +90,70 @@ func (d *DiskStore) Save(_ context.Context, state *leaseState) error {
 	ciphertext := d.aead.Seal(nil, nonce, payload, nil)
 	blob := append(nonce, ciphertext...)
 
-	file, err := os.OpenFile(temp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	// Exclusive creation prevents existing symlinks, while a random name
+	// permits concurrent saves without sharing a temporary pathname.
+	temp, file, err := d.createTemp()
 	if err != nil {
-		return err
+		return fmt.Errorf("create temporary lease file: %w", err)
+	}
+	defer func() { _ = d.root.Remove(temp) }()
+
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("set temporary lease permissions: %w", err)
 	}
 	if _, err := file.Write(blob); err != nil {
 		_ = file.Close()
-		return err
+		return fmt.Errorf("write temporary lease file: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("sync temporary lease file: %w", err)
 	}
 	if err := file.Close(); err != nil {
-		return err
+		return fmt.Errorf("close temporary lease file: %w", err)
 	}
-	if err := os.Rename(temp, path); err != nil {
-		_ = os.Remove(temp)
-		return err
+	if err := d.root.Rename(temp, name); err != nil {
+		return fmt.Errorf("replace lease file: %w", err)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return err
+	return d.syncDirectory()
+}
+
+// createTemp uses a cryptographically random filename and O_EXCL: neither a
+// preexisting symlink nor a competing save can redirect its initial write.
+func (d *DiskStore) createTemp() (string, *os.File, error) {
+	for range 10 {
+		var suffix [16]byte
+		if _, err := io.ReadFull(rand.Reader, suffix[:]); err != nil {
+			return "", nil, err
+		}
+		name := fmt.Sprintf(".lease-%x.tmp", suffix)
+		file, err := d.root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			return name, file, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return "", nil, err
+		}
+	}
+	return "", nil, errors.New("unable to allocate unique temporary lease filename")
+}
+
+func (d *DiskStore) syncDirectory() error {
+	// Directory handle syncing is not supported consistently on Windows.
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	dir, err := d.root.Open(".")
+	if err != nil {
+		return fmt.Errorf("open store directory for sync: %w", err)
+	}
+	err = dir.Sync()
+	if closeErr := dir.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return fmt.Errorf("sync store directory: %w", err)
 	}
 	return nil
 }
@@ -107,8 +163,18 @@ func (d *DiskStore) Load(_ context.Context, leaseID string) (*leaseState, error)
 	if leaseID == "" {
 		return nil, ErrInvalidLeaseID
 	}
-	path := d.pathForLease(leaseID)
-	blob, err := os.ReadFile(path)
+	name := filepath.Base(d.pathForLease(leaseID))
+	info, err := d.root.Lstat(name)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ErrLeaseNotFound
+		}
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: lease is not a regular file", ErrCorruptStore)
+	}
+	blob, err := d.root.ReadFile(name)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, ErrLeaseNotFound
@@ -117,33 +183,33 @@ func (d *DiskStore) Load(_ context.Context, leaseID string) (*leaseState, error)
 	}
 	nonceSize := d.aead.NonceSize()
 	if len(blob) <= nonceSize {
-		return nil, d.markCorrupt(path, errors.New("payload truncated"))
+		return nil, d.markCorrupt(name, errors.New("payload truncated"))
 	}
 
 	nonce := blob[:nonceSize]
 	ciphertext := blob[nonceSize:]
 	plaintext, err := d.aead.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
-		return nil, d.markCorrupt(path, err)
+		return nil, d.markCorrupt(name, err)
 	}
 
 	var state leaseState
 	if err := json.Unmarshal(plaintext, &state); err != nil {
-		return nil, d.markCorrupt(path, err)
+		return nil, d.markCorrupt(name, err)
 	}
 	if normalizeLeaseID(state.LeaseID) != leaseID {
-		return nil, d.markCorrupt(path, errors.New("lease id mismatch"))
+		return nil, d.markCorrupt(name, errors.New("lease id mismatch"))
 	}
 	if normalizeLeaseID(state.Current.LeaseID) != leaseID {
-		return nil, d.markCorrupt(path, errors.New("current lease id mismatch"))
+		return nil, d.markCorrupt(name, errors.New("current lease id mismatch"))
 	}
 	return &state, nil
 }
 
-func (d *DiskStore) markCorrupt(path string, cause error) error {
-	corruptPath := path + ".corrupt"
-	_ = os.Remove(corruptPath)
-	_ = os.Rename(path, corruptPath)
+func (d *DiskStore) markCorrupt(name string, cause error) error {
+	corruptName := name + ".corrupt"
+	_ = d.root.Remove(corruptName)
+	_ = d.root.Rename(name, corruptName)
 	return fmt.Errorf("%w: %v", ErrCorruptStore, cause)
 }
 
@@ -169,4 +235,75 @@ func sanitizePathToken(value string) string {
 		return "anonymous"
 	}
 	return b.String()
+}
+
+// openTrustedStoreRoot walks directory components through pinned os.Root handles.
+// It never follows symlinks or changes permissions on directories of unknown ownership.
+func openTrustedStoreRoot(absDir string) (root *os.Root, err error) {
+	volume := filepath.VolumeName(absDir)
+	base := volume + string(filepath.Separator)
+	if absDir == base {
+		return nil, errors.New("store path must not be a volume root")
+	}
+
+	root, err = os.OpenRoot(base)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			_ = root.Close()
+		}
+	}()
+
+	info, err := root.Stat(".")
+	if err != nil {
+		return nil, err
+	}
+	if err := validateStoreDirectory(info, false); err != nil {
+		return nil, fmt.Errorf("untrusted ancestor %q: %w", base, err)
+	}
+
+	parts := strings.Split(strings.TrimPrefix(absDir, base), string(filepath.Separator))
+	for i, part := range parts {
+		info, err := root.Lstat(part)
+		if errors.Is(err, os.ErrNotExist) {
+			if err = root.Mkdir(part, 0o700); err != nil {
+				return nil, fmt.Errorf("create store directory component %q: %w", part, err)
+			}
+			info, err = root.Lstat(part)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return nil, fmt.Errorf("store component %q is a symlink or not a directory", part)
+		}
+
+		next, openErr := root.OpenRoot(part)
+		if openErr != nil {
+			return nil, openErr
+		}
+		actual, statErr := next.Stat(".")
+		if statErr != nil {
+			_ = next.Close()
+			return nil, statErr
+		}
+		if !os.SameFile(info, actual) {
+			_ = next.Close()
+			return nil, fmt.Errorf("store component %q changed during validation", part)
+		}
+		if checkErr := validateStoreDirectory(actual, i == len(parts)-1); checkErr != nil {
+			_ = next.Close()
+			return nil, fmt.Errorf("untrusted store component %q: %w", part, checkErr)
+		}
+		_ = root.Close()
+		root = next
+	}
+
+	// Chmod is relative to the verified root itself, not an untrusted pathname.
+	if err = root.Chmod(".", 0o700); err != nil {
+		return nil, fmt.Errorf("set store directory permissions: %w", err)
+	}
+	return root, nil
 }

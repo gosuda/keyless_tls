@@ -17,14 +17,14 @@ import (
 
 func main() {
 	var (
-		listenAddr         = flag.String("listen", ":443", "public relay listen address")
-		defaultUpstream    = flag.String("default-upstream", "", "fallback upstream when visible SNI route is missing, including ECH outer SNI")
-		dialTimeout        = flag.Duration("dial-timeout", 3*time.Second, "upstream dial timeout")
-		clientHelloTimeout = flag.Duration("clienthello-timeout", 2*time.Second, "TLS ClientHello inspect timeout")
-		maxConnections     = flag.Int("max-connections", 1024, "maximum concurrent relay connections")
+		listenAddr          = flag.String("listen", ":443", "public relay listen address")
+		defaultUpstream     = flag.String("default-upstream", "", "fallback upstream when visible SNI route is missing, including ECH outer SNI")
+		dialTimeout         = flag.Duration("dial-timeout", 3*time.Second, "upstream dial timeout")
+		clientHelloTimeout  = flag.Duration("clienthello-timeout", 2*time.Second, "TLS ClientHello inspect timeout")
+		maxConnections      = flag.Int("max-connections", 1024, "maximum concurrent relay connections")
 		maxConnectionsPerIP = flag.Int("max-connections-per-ip", 64, "maximum concurrent relay connections from one source IP")
-		idleTimeout        = flag.Duration("idle-timeout", 2*time.Minute, "close established connections after this period without traffic")
-		allowParseError    = flag.Bool("allow-parse-error", true, "if true, allow non-TLS/invalid ClientHello to use default route")
+		idleTimeout         = flag.Duration("idle-timeout", 2*time.Minute, "close established connections after this period without traffic")
+		allowParseError     = flag.Bool("allow-parse-error", true, "if true, allow non-TLS/invalid ClientHello to use default route")
 	)
 	var routes routeFlag
 	flag.Var(&routes, "route", "SNI route in form host=upstream (repeatable)")
@@ -43,8 +43,8 @@ func main() {
 	}
 
 	proxy := &l4.Proxy{
-		ListenAddr:         *listenAddr,
-		ClientHelloTimeout: *clientHelloTimeout,
+		ListenAddr:          *listenAddr,
+		ClientHelloTimeout:  *clientHelloTimeout,
 		MaxConnections:      *maxConnections,
 		MaxConnectionsPerIP: *maxConnectionsPerIP,
 		IdleTimeout:         *idleTimeout,

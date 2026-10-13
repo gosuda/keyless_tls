@@ -22,6 +22,7 @@ type Config struct {
 	ServerKeyPEM  []byte
 	ClientCAPEM   []byte
 	SignerService *signer.Service
+	Limits        Limits // Zero fields use safe defaults.
 }
 
 func ListenAndServe(ctx context.Context, cfg Config) error {
@@ -30,6 +31,11 @@ func ListenAndServe(ctx context.Context, cfg Config) error {
 	}
 	if cfg.SignerService == nil {
 		return errors.New("signer service is required")
+	}
+
+	limits, err := cfg.Limits.withDefaults()
+	if err != nil {
+		return err
 	}
 
 	tlsConf, err := serverTLSConfig(cfg.ServerCertPEM, cfg.ServerKeyPEM, cfg.ClientCAPEM)
@@ -41,16 +47,27 @@ func ListenAndServe(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("listen signer server: %w", err)
 	}
-	tlsLis := tls.NewListener(lis, tlsConf)
+	return serve(ctx, lis, tlsConf, signHandler(cfg.SignerService), limits)
+}
 
-	httpServer := &http.Server{Handler: signHandler(cfg.SignerService)}
+func serve(ctx context.Context, lis net.Listener, tlsConf *tls.Config, handler http.Handler, limits Limits) error {
+	// Limit raw sockets before clients can complete TLS authentication.
+	tlsLis := tls.NewListener(newConnectionLimitListener(lis, limits), tlsConf)
+	httpServer := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: limits.ReadHeaderTimeout, // Also bounds the TLS handshake.
+		ReadTimeout:       limits.ReadTimeout,
+		WriteTimeout:      limits.WriteTimeout,
+		IdleTimeout:       limits.IdleTimeout,
+		MaxHeaderBytes:    limits.MaxHeaderBytes,
+	}
 
-	go func() {
-		<-ctx.Done()
+	stopShutdown := context.AfterFunc(ctx, func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = httpServer.Shutdown(shutdownCtx)
-	}()
+	})
+	defer stopShutdown()
 
 	return httpServer.Serve(tlsLis)
 }

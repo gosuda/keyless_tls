@@ -149,6 +149,154 @@ func TestLifecycleValidateRejectsMismatchedLease(t *testing.T) {
 	}
 }
 
+func TestLifecycleRequiresLeaseAuthorizer(t *testing.T) {
+	t.Parallel()
+
+	clock := newTestClock(time.Now().UTC())
+	cfg := newTestManagerConfig(t, clock)
+	if _, err := NewManager(cfg); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("expected missing authorizer to reject constructor, got %v", err)
+	}
+
+	trusted, err := NewTrustedManager(cfg)
+	if err != nil {
+		t.Fatalf("new trusted manager: %v", err)
+	}
+	ctx := context.Background()
+	if _, err := trusted.IssueIdentity(ctx, "lease-trusted", ChallengeProof{}, nil); err != nil {
+		t.Fatalf("trusted issuance: %v", err)
+	}
+	if _, err := trusted.LoadIdentity(ctx, "lease-trusted", ChallengeProof{}); err != nil {
+		t.Fatalf("trusted load: %v", err)
+	}
+	if _, err := trusted.RenewIdentity(ctx, "lease-trusted", ChallengeProof{}); err != nil {
+		t.Fatalf("trusted renewal: %v", err)
+	}
+
+	cfg.Authorizer = &testLeaseAuthorizer{used: make(map[string]struct{})}
+	if _, err := NewTrustedManager(cfg); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("trusted constructor must reject conflicting authorizer: %v", err)
+	}
+}
+
+func TestLifecycleRequiresProofForKeyAccessAndRotation(t *testing.T) {
+	t.Parallel()
+
+	clock := newTestClock(time.Now().UTC())
+	manager := newTestManager(t, clock, true)
+	ctx := leaseTestContext("lease-a")
+	original, err := manager.IssueIdentity(ctx, "lease-a", testProof("lease-a", OperationIssue, "nonce-proof-issue"), nil)
+	if err != nil {
+		t.Fatalf("issue identity: %v", err)
+	}
+
+	if _, err := manager.LoadIdentity(ctx, "lease-a", ChallengeProof{}); !errors.Is(err, ErrChallengeRequired) {
+		t.Fatalf("load without proof should fail closed: %v", err)
+	}
+	if _, err := manager.RenewIdentity(ctx, "lease-a", ChallengeProof{}); !errors.Is(err, ErrChallengeRequired) {
+		t.Fatalf("renew without proof should fail closed: %v", err)
+	}
+	if _, err := manager.ReissueIdentity(ctx, "lease-a", ChallengeProof{}, "recovery"); !errors.Is(err, ErrChallengeRequired) {
+		t.Fatalf("reissue without proof should fail closed: %v", err)
+	}
+
+	loaded, err := manager.LoadIdentity(ctx, "lease-a", testProof("lease-a", OperationLoad, "nonce-proof-load"))
+	if err != nil {
+		t.Fatalf("authorized load: %v", err)
+	}
+	if loaded.Epoch != original.Epoch || !bytes.Equal(loaded.KeyPEM, original.KeyPEM) {
+		t.Fatal("unauthorized rotation changed the stored identity")
+	}
+}
+
+func TestLifecycleCrossLeaseAuthorization(t *testing.T) {
+	t.Parallel()
+
+	clock := newTestClock(time.Now().UTC())
+	manager := newTestManager(t, clock, true)
+	ctxA := leaseTestContext("lease-a")
+	ctxB := leaseTestContext("lease-b")
+	if _, err := manager.IssueIdentity(ctxA, "lease-a", testProof("lease-a", OperationIssue, "nonce-create-a"), nil); err != nil {
+		t.Fatalf("issue lease a: %v", err)
+	}
+	originalB, err := manager.IssueIdentity(ctxB, "lease-b", testProof("lease-b", OperationIssue, "nonce-create-b"), nil)
+	if err != nil {
+		t.Fatalf("issue lease b: %v", err)
+	}
+
+	attacks := []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "issue",
+			run: func() error {
+				_, err := manager.IssueIdentity(ctxA, "lease-b", testProof("lease-b", OperationIssue, "nonce-cross-issue"), nil)
+				return err
+			},
+		},
+		{
+			name: "load",
+			run: func() error {
+				_, err := manager.LoadIdentity(ctxA, "lease-b", testProof("lease-b", OperationLoad, "nonce-cross-load"))
+				return err
+			},
+		},
+		{
+			name: "renew",
+			run: func() error {
+				_, err := manager.RenewIdentity(ctxA, "lease-b", testProof("lease-b", OperationRenew, "nonce-cross-renew"))
+				return err
+			},
+		},
+		{
+			name: "reissue",
+			run: func() error {
+				_, err := manager.ReissueIdentity(ctxA, "lease-b", testProof("lease-b", OperationReissue, "nonce-cross-reissue"), "recovery")
+				return err
+			},
+		},
+	}
+	for _, attack := range attacks {
+		t.Run(attack.name, func(t *testing.T) {
+			if err := attack.run(); !errors.Is(err, ErrChallengeRejected) {
+				t.Fatalf("expected cross-lease rejection, got %v", err)
+			}
+		})
+	}
+
+	loadedB, err := manager.LoadIdentity(ctxB, "lease-b", testProof("lease-b", OperationLoad, "nonce-check-b"))
+	if err != nil {
+		t.Fatalf("load lease b after attacks: %v", err)
+	}
+	if loadedB.Epoch != originalB.Epoch || !bytes.Equal(loadedB.KeyPEM, originalB.KeyPEM) {
+		t.Fatal("cross-lease requests mutated the target credentials")
+	}
+}
+
+func TestLifecycleProofIsOperationBoundAndSingleUse(t *testing.T) {
+	t.Parallel()
+
+	clock := newTestClock(time.Now().UTC())
+	manager := newTestManager(t, clock, true)
+	ctx := leaseTestContext("lease-a")
+	if _, err := manager.IssueIdentity(ctx, "lease-a", testProof("lease-a", OperationIssue, "nonce-op-issue"), nil); err != nil {
+		t.Fatalf("issue identity: %v", err)
+	}
+	wrongOperation := testProof("lease-a", OperationIssue, "nonce-wrong-operation")
+	if _, err := manager.LoadIdentity(ctx, "lease-a", wrongOperation); !errors.Is(err, ErrChallengeRejected) {
+		t.Fatalf("expected wrong-operation proof rejection, got %v", err)
+	}
+
+	proof := testProof("lease-a", OperationLoad, "nonce-once")
+	if _, err := manager.LoadIdentity(ctx, "lease-a", proof); err != nil {
+		t.Fatalf("first load: %v", err)
+	}
+	if _, err := manager.LoadIdentity(ctx, "lease-a", proof); !errors.Is(err, ErrChallengeRejected) {
+		t.Fatalf("expected replay rejection, got %v", err)
+	}
+}
+
 type leaseTestPrincipalKey struct{}
 
 type testLeaseAuthorizer struct {

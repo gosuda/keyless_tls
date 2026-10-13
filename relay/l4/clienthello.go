@@ -298,3 +298,10 @@ func (c *preloadedConn) Read(p []byte) (int, error) {
 	}
 	return c.Conn.Read(p)
 }
+
+func (c *preloadedConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}

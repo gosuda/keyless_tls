@@ -452,6 +452,22 @@ library's core guarantee, not one deployment's hardening choice.
 
 ## Security and operations notes
 
+### Signer listener resource limits
+
+The signer sets HTTP and TLS-handshake deadlines even before mTLS authentication. Its defaults are:
+
+| Limit | Default |
+| --- | ---: |
+| TLS handshake and HTTP headers (`ReadHeaderTimeout`) | 5 s |
+| Full HTTP request (`ReadTimeout`) | 10 s |
+| Response write (`WriteTimeout`) | 15 s |
+| Idle keep-alive connection (`IdleTimeout`) | 30 s |
+| Request headers (`MaxHeaderBytes`) | 16 KiB |
+| Simultaneous connections (`MaxConnections`) | 256 |
+| Connections per remote IP (`MaxConnectionsPerIP`) | 64 |
+
+An accepted connection counts toward both connection caps until it closes, including during its TLS handshake. Extra connections are closed immediately. Go's HTTP server applies the read-header timeout to the TLS handshake as well. When embedding the signer, override these defaults using `server.Config{Limits: server.Limits{...}}`. Zero fields retain the defaults; negative values are rejected. Account for trusted reverse proxies or shared source IPs when tuning the per-IP cap.
+
 - Store private keys only in `relay-signer`; never distribute them to tunnel apps
 - Keep only the public certificate chain in tunnel apps
 - Enforce signer mTLS and pair it with `KeyID`-scoped ACLs

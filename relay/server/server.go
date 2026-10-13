@@ -22,6 +22,7 @@ type Config struct {
 	ServerKeyPEM  []byte
 	ClientCAPEM   []byte
 	SignerService *signer.Service
+	Limits        Limits
 }
 
 func ListenAndServe(ctx context.Context, cfg Config) error {
@@ -32,6 +33,10 @@ func ListenAndServe(ctx context.Context, cfg Config) error {
 		return errors.New("signer service is required")
 	}
 
+	limits, err := cfg.Limits.withDefaults()
+	if err != nil {
+		return err
+	}
 	tlsConf, err := serverTLSConfig(cfg.ServerCertPEM, cfg.ServerKeyPEM, cfg.ClientCAPEM)
 	if err != nil {
 		return err
@@ -41,9 +46,8 @@ func ListenAndServe(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("listen signer server: %w", err)
 	}
-	tlsLis := tls.NewListener(lis, tlsConf)
-
-	httpServer := &http.Server{Handler: signHandler(cfg.SignerService)}
+	tlsLis := tls.NewListener(newLimitedListener(lis, limits.MaxConnections, limits.MaxConnectionsPerIP), tlsConf)
+	httpServer := newHTTPServer(cfg.SignerService, limits)
 
 	go func() {
 		<-ctx.Done()
@@ -53,6 +57,17 @@ func ListenAndServe(ctx context.Context, cfg Config) error {
 	}()
 
 	return httpServer.Serve(tlsLis)
+}
+
+func newHTTPServer(service *signer.Service, limits Limits) *http.Server {
+	return &http.Server{
+		Handler:           signHandler(service),
+		ReadHeaderTimeout: limits.ReadHeaderTimeout,
+		ReadTimeout:       limits.ReadTimeout,
+		WriteTimeout:      limits.WriteTimeout,
+		IdleTimeout:       limits.IdleTimeout,
+		MaxHeaderBytes:    limits.MaxHeaderBytes,
+	}
 }
 
 func signHandler(service *signer.Service) http.Handler {

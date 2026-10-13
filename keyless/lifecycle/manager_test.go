@@ -74,6 +74,35 @@ func TestLifecycleIssueLoadRenewAndValidate(t *testing.T) {
 	}
 }
 
+
+func TestLifecycleRejectsReplayedCurrentAfterOverlap(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	clock := newTestClock(time.Now().UTC())
+	manager := newTestManager(t, clock, false)
+	first, err := manager.IssueIdentity(ctx, "lease-replay", ChallengeProof{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := manager.cfg.Store.(*DiskStore)
+	path := store.pathForLease("lease-replay")
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.RenewIdentity(ctx, "lease-replay"); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(3 * time.Minute)
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ValidateIdentity("lease-replay", mustParseLeaf(t, first.CertPEM)); !errors.Is(err, ErrCorruptStore) {
+		t.Fatalf("replayed current credential accepted: %v", err)
+	}
+}
+
 func TestLifecycleChallengeAndReissueRules(t *testing.T) {
 	t.Parallel()
 

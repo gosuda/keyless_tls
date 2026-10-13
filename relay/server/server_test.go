@@ -31,7 +31,7 @@ func TestServerTLSConfig_WithMTLS(t *testing.T) {
 		t.Fatalf("create client CA cert: %v", err)
 	}
 
-	tlsConf, err := serverTLSConfig(serverCertPEM, serverKeyPEM, clientCAPEM)
+	tlsConf, err := serverTLSConfig(serverCertPEM, serverKeyPEM, clientCAPEM, false)
 	if err != nil {
 		t.Fatalf("serverTLSConfig() error = %v", err)
 	}
@@ -43,13 +43,25 @@ func TestServerTLSConfig_WithMTLS(t *testing.T) {
 	}
 }
 
-func TestServerTLSConfig_WithoutMTLS(t *testing.T) {
+func TestServerTLSConfig_RequiresClientCA(t *testing.T) {
 	serverCertPEM, serverKeyPEM, err := testutil.GenerateCert("test.local", false)
 	if err != nil {
 		t.Fatalf("create server cert: %v", err)
 	}
 
-	tlsConf, err := serverTLSConfig(serverCertPEM, serverKeyPEM, nil)
+	_, err = serverTLSConfig(serverCertPEM, serverKeyPEM, nil, false)
+	if err == nil || !strings.Contains(err.Error(), "client CA PEM is required") {
+		t.Fatalf("expected missing client CA error, got %v", err)
+	}
+}
+
+func TestServerTLSConfig_ExplicitInsecureNoClientAuth(t *testing.T) {
+	serverCertPEM, serverKeyPEM, err := testutil.GenerateCert("test.local", false)
+	if err != nil {
+		t.Fatalf("create server cert: %v", err)
+	}
+
+	tlsConf, err := serverTLSConfig(serverCertPEM, serverKeyPEM, nil, true)
 	if err != nil {
 		t.Fatalf("serverTLSConfig() error = %v", err)
 	}
@@ -57,7 +69,7 @@ func TestServerTLSConfig_WithoutMTLS(t *testing.T) {
 		t.Fatalf("expected ClientAuth=%v, got %v", tls.NoClientCert, tlsConf.ClientAuth)
 	}
 	if tlsConf.ClientCAs != nil {
-		t.Fatal("expected ClientCAs to be nil when mTLS is disabled")
+		t.Fatal("expected ClientCAs to be nil when mTLS is explicitly disabled")
 	}
 }
 
@@ -67,7 +79,7 @@ func TestServerTLSConfig_InvalidCAPEM(t *testing.T) {
 		t.Fatalf("create server cert: %v", err)
 	}
 
-	_, err = serverTLSConfig(serverCertPEM, serverKeyPEM, []byte("not-valid-pem"))
+	_, err = serverTLSConfig(serverCertPEM, serverKeyPEM, []byte("not-valid-pem"), false)
 	if err == nil {
 		t.Fatal("expected error for invalid client CA PEM")
 	}

@@ -406,7 +406,7 @@ Important flags for `examples/relay-10-targets`:
 
 ### mTLS is required for signer transport
 
-Signer and tunnel clients must always be configured for mutual TLS.
+Signer and tunnel clients must use mutual TLS in production. `relay/server.ListenAndServe` rejects a missing `ClientCAPEM` before opening a listener. The only exception is the explicit insecure local/demo mode: `server.Config.AllowInsecureNoClientAuth` (or the binary's `-allow-insecure-no-client-auth`). Never expose a demo-mode signer to untrusted networks.
 
 ```bash
 go run ./cmd/relay-signer \

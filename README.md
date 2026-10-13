@@ -455,6 +455,12 @@ library's core guarantee, not one deployment's hardening choice.
 - Store private keys only in `relay-signer`; never distribute them to tunnel apps
 - Keep only the public certificate chain in tunnel apps
 - Enforce signer mTLS and pair it with `KeyID`-scoped ACLs
+- Signer sockets are bounded before TLS authentication: 256 concurrent connections globally, 64 per source IP.
+- The signer enforces a 5-second TLS handshake/header deadline, 10-second request-read deadline,
+  15-second write deadline, 30-second idle deadline, and 16 KiB maximum HTTP headers.
+- Applications can override these bounds via `server.Config.Limits`; zero values use the safe
+  defaults. Set the per-source connection cap for the peer addresses the signer actually sees:
+  behind a reverse proxy, that may be the proxy's IP rather than each original client.
 
 ### Signer API contract (`/v1/sign`)
 

@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -137,12 +140,23 @@ func signByAlgorithm(signer crypto.Signer, digest []byte, algorithm string) ([]b
 		return nil, errors.New("signer is nil")
 	}
 
+	public := signer.Public()
 	switch algorithm {
 	case signrpc.AlgorithmECDSASHA256:
+		key, ok := public.(*ecdsa.PublicKey)
+		if !ok || key.Curve != elliptic.P256() {
+			return nil, errors.New("ECDSA_SHA256 requires a P-256 ECDSA key")
+		}
 		return signer.Sign(rand.Reader, digest, crypto.SHA256)
 	case signrpc.AlgorithmRSAPSSSHA256:
+		if _, ok := public.(*rsa.PublicKey); !ok {
+			return nil, errors.New("RSA_PSS_SHA256 requires an RSA key")
+		}
 		return signer.Sign(rand.Reader, digest, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: crypto.SHA256})
 	case signrpc.AlgorithmEd25519:
+		if _, ok := public.(ed25519.PublicKey); !ok {
+			return nil, errors.New("Ed25519 requires an Ed25519 key")
+		}
 		return signer.Sign(rand.Reader, digest, crypto.Hash(0))
 	default:
 		return nil, fmt.Errorf("unsupported algorithm: %s", algorithm)

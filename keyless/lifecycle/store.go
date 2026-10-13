@@ -239,7 +239,7 @@ func sanitizePathToken(value string) string {
 
 // openTrustedStoreRoot walks directory components through pinned os.Root handles.
 // It never follows symlinks or changes permissions on directories of unknown ownership.
-func openTrustedStoreRoot(absDir string) (result *os.Root, err error) {
+func openTrustedStoreRoot(absDir string) (*os.Root, error) {
 	volume := filepath.VolumeName(absDir)
 	base := volume + string(filepath.Separator)
 	if absDir == base {
@@ -250,8 +250,9 @@ func openTrustedStoreRoot(absDir string) (result *os.Root, err error) {
 	if err != nil {
 		return nil, err
 	}
+	keepOpen := false
 	defer func() {
-		if err != nil {
+		if !keepOpen {
 			_ = root.Close()
 		}
 	}()
@@ -302,8 +303,9 @@ func openTrustedStoreRoot(absDir string) (result *os.Root, err error) {
 	}
 
 	// Chmod is relative to the verified root itself, not an untrusted pathname.
-	if err = root.Chmod(".", 0o700); err != nil {
+	if err := root.Chmod(".", 0o700); err != nil {
 		return nil, fmt.Errorf("set store directory permissions: %w", err)
 	}
+	keepOpen = true
 	return root, nil
 }

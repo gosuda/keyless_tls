@@ -196,11 +196,14 @@ func TestSignTranscript_SignsWithoutValidator(t *testing.T) {
 type blockingCryptoSigner struct {
 	entered chan struct{}
 	release <-chan struct{}
-	active atomic.Int32
-	peak atomic.Int32
+	active  atomic.Int32
+	peak    atomic.Int32
 }
 
-func (s *blockingCryptoSigner) Public() crypto.PublicKey { return nil }
+func (s *blockingCryptoSigner) Public() crypto.PublicKey {
+	curve := elliptic.P256()
+	return &ecdsa.PublicKey{Curve: curve, X: curve.Params().Gx, Y: curve.Params().Gy}
+}
 
 func (s *blockingCryptoSigner) Sign(_ io.Reader, _ []byte, _ crypto.SignerOpts) ([]byte, error) {
 	current := s.active.Add(1)
@@ -242,8 +245,8 @@ func TestSignTranscript_BoundsConcurrentSignOperations(t *testing.T) {
 	defer unblock()
 	blocker := &blockingCryptoSigner{entered: make(chan struct{}, 2), release: release}
 	svc := &signer.Service{
-		Store: keyedStore{"a": blocker, "b": blocker, "c": blocker},
-		MaxConcurrentSigns: 2,
+		Store:                    keyedStore{"a": blocker, "b": blocker, "c": blocker},
+		MaxConcurrentSigns:       2,
 		MaxConcurrentSignsPerKey: 1,
 	}
 	var wg sync.WaitGroup
@@ -310,4 +313,19 @@ func closedChannel() <-chan struct{} {
 	ch := make(chan struct{})
 	close(ch)
 	return ch
+}
+
+func TestRejectedSignsDoesNotInitializeInvalidLimits(t *testing.T) {
+	svc := &signer.Service{MaxConcurrentSigns: -1}
+	if got := svc.RejectedSigns(); got != 0 {
+		t.Fatalf("initial rejection metric = %d, want zero", got)
+	}
+	// Configuration remains available after the initial metrics read.
+	svc.MaxConcurrentSigns = 1
+	svc.Store = keyedStore{"a": &blockingCryptoSigner{
+		entered: make(chan struct{}, 1), release: closedChannel(),
+	}}
+	if _, err := svc.SignTranscript(context.Background(), signRequest("a")); err != nil {
+		t.Fatalf("sign after configuring limits: %v", err)
+	}
 }

@@ -1,0 +1,33 @@
+name: L4 relay tests
+
+on:
+  pull_request:
+    paths:
+      - "relay/l4/**"
+      - "cmd/relay-l4/**"
+      - "go.mod"
+      - ".github/workflows/l4-relay.yml"
+  push:
+    branches: [main]
+    paths:
+      - "relay/l4/**"
+      - "cmd/relay-l4/**"
+      - "go.mod"
+      - ".github/workflows/l4-relay.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Test L4 relay with race detector
+        run: go test -race -count=1 ./relay/l4 ./cmd/relay-l4
+      - name: Vet L4 relay
+        run: go vet ./relay/l4 ./cmd/relay-l4

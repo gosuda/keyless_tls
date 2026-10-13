@@ -44,9 +44,9 @@ func main() {
 		clientCertPath = flag.String("client-cert", "", "client cert PEM path for signer mTLS")
 		clientKeyPath  = flag.String("client-key", "", "client key PEM path for signer mTLS")
 		rootCAPath     = flag.String("root-ca", "", "signer root CA PEM path")
-		maxHandshakes = flag.Int("max-handshakes", 64, "maximum concurrent TLS handshakes")
-		maxPerSource = flag.Int("max-handshakes-per-source", 8, "maximum concurrent handshakes per source IP")
-		handshakeRate = flag.Int("handshake-rate", 20, "per-source handshake rate per second")
+		maxHandshakes  = flag.Int("max-handshakes", 64, "maximum concurrent TLS handshakes")
+		maxPerSource   = flag.Int("max-handshakes-per-source", 8, "maximum concurrent handshakes per source IP")
+		handshakeRate  = flag.Int("handshake-rate", 20, "per-source handshake rate per second")
 		handshakeBurst = flag.Int("handshake-burst", 40, "per-source handshake burst")
 	)
 	flag.Parse()
@@ -81,13 +81,13 @@ func main() {
 	defer rSigner.Close()
 
 	tlsSrv, err := t13server.NewServer(t13server.Config{
-		CertPEM:          certPEM,
-		KeyID:            *keyID,
-		TranscriptSigner: rSigner,
-		MaxConcurrentHandshakes: *maxHandshakes,
-		MaxHandshakesPerSource: *maxPerSource,
+		CertPEM:                      certPEM,
+		KeyID:                        *keyID,
+		TranscriptSigner:             rSigner,
+		MaxConcurrentHandshakes:      *maxHandshakes,
+		MaxHandshakesPerSource:       *maxPerSource,
 		HandshakesPerSourcePerSecond: *handshakeRate,
-		HandshakeBurstPerSource: *handshakeBurst,
+		HandshakeBurstPerSource:      *handshakeBurst,
 	})
 	if err != nil {
 		log.Fatalf("create keyless tls server: %v", err)

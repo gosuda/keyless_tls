@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gosuda/keyless_tls/internal/admission"
@@ -24,7 +28,7 @@ var (
 )
 
 const (
-	defaultMaxConcurrentSigns = 32
+	defaultMaxConcurrentSigns       = 32
 	defaultMaxConcurrentSignsPerKey = 8
 )
 
@@ -58,11 +62,12 @@ type Service struct {
 
 	admissionOnce sync.Once
 	admission     *admission.Limiter
+	rejectedSigns atomic.Uint64
 }
 
 // RejectedSigns reports overload decisions made by this service.
 func (s *Service) RejectedSigns() uint64 {
-	return s.signingAdmission().Rejections()
+	return s.rejectedSigns.Load()
 }
 
 func (s *Service) signingAdmission() *admission.Limiter {
@@ -76,9 +81,9 @@ func (s *Service) signingAdmission() *admission.Limiter {
 			perKey = defaultMaxConcurrentSignsPerKey
 		}
 		s.admission = admission.New(admission.Limits{
-			MaxConcurrent: total,
+			MaxConcurrent:  total,
 			MaxPerIdentity: perKey,
-			MaxIdentities: total,
+			MaxIdentities:  total,
 		})
 	})
 	return s.admission
@@ -124,6 +129,7 @@ func (s *Service) SignTranscript(ctx context.Context, req *signrpc.TranscriptSig
 	}
 	limiter := s.signingAdmission()
 	if !limiter.TryAcquire(req.KeyID) {
+		s.rejectedSigns.Add(1)
 		return nil, ErrOverloaded
 	}
 	defer limiter.Release(req.KeyID)
@@ -190,6 +196,20 @@ func hashContentForAlgorithm(content []byte, algorithm string) ([]byte, error) {
 func signByAlgorithm(signer crypto.Signer, digest []byte, algorithm string) ([]byte, error) {
 	if signer == nil {
 		return nil, errors.New("signer is nil")
+	}
+
+	// The key, not the caller, determines which TLS signature scheme is allowed.
+	var compatible bool
+	switch pub := signer.Public().(type) {
+	case *ecdsa.PublicKey:
+		compatible = pub != nil && pub.Curve == elliptic.P256() && algorithm == signrpc.AlgorithmECDSASHA256
+	case *rsa.PublicKey:
+		compatible = pub != nil && algorithm == signrpc.AlgorithmRSAPSSSHA256
+	case ed25519.PublicKey:
+		compatible = len(pub) == ed25519.PublicKeySize && algorithm == signrpc.AlgorithmEd25519
+	}
+	if !compatible {
+		return nil, fmt.Errorf("algorithm %q is incompatible with signer public key", algorithm)
 	}
 
 	switch algorithm {

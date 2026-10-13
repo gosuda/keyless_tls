@@ -59,9 +59,15 @@ func (l *Limiter) TryAcquire(identity string) bool {
 	state := l.identities[identity]
 	if state == nil {
 		if len(l.identities) >= l.limits.MaxIdentities {
+			scanned := 0
 			for name, existing := range l.identities {
 				if existing.active == 0 && now.Sub(existing.last) >= idleRetention {
 					delete(l.identities, name)
+					break
+				}
+				scanned++
+				if scanned >= 64 {
+					break
 				}
 			}
 		}

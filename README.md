@@ -134,6 +134,9 @@ through `Service.RejectedSigns()`.
 
 The HTTPS signing handler also limits each mTLS client certificate to four
 concurrent requests and a token bucket of 20 requests/second, burst 40.
+The aggregate request limit is 128, or the configured per-client concurrency
+when that is higher. Server read deadlines bound incomplete request bodies so
+they cannot retain request admission slots indefinitely.
 In explicit insecure/demo mode without mTLS, limits apply to the network
 source IP instead. Configure the signer binary with `-max-signs`,
 `-max-signs-per-key`, `-max-client-concurrent`, `-client-rate`, and
@@ -386,6 +389,18 @@ Useful `cmd/relay-l4` route-mode flags:
 - `-default-upstream`: fallback target for unknown visible SNI, including ECH outer SNI misses
 - `-allow-parse-error`: allow non-TLS/invalid ClientHello to use fallback
 - `-clienthello-timeout`: maximum ClientHello inspection time
+- `-max-connections`: simultaneous relay connection cap, including ClientHello inspection (default 1,024)
+- `-max-connections-per-ip`: simultaneous connections allowed from one source IP (default 64)
+- `-idle-timeout`: close established connections after this period without traffic in either direction (default 2 minutes)
+
+These limits apply before routing and remain in force after routing. SDK users can set
+`l4.Proxy.MaxConnections`, `MaxConnectionsPerIP`, and `IdleTimeout`. A zero value
+selects the same safe defaults; negative values are rejected by `Proxy.Serve`.
+The inspector rejects TLS handshake records larger than 16 KiB and bounds fragmented
+ClientHello inspection to 64 KiB of handshake data, 128 KiB of captured traffic,
+and 128 records. Inspection-limit errors are rejected before routing, including
+when parse-error fallback is enabled. Cancellation closes admitted connections
+and their upstreams.
 
 ### Example app: one relay routing 10 target hosts
 
@@ -438,7 +453,7 @@ Important flags for `examples/relay-10-targets`:
 
 ### mTLS is required for signer transport
 
-Signer and tunnel clients must always be configured for mutual TLS.
+Signer and tunnel clients must use mutual TLS in production. `relay/server.ListenAndServe` rejects a missing `ClientCAPEM` before opening a listener. The only exception is the explicit insecure local/demo mode: `server.Config.AllowInsecureNoClientAuth` (or the binary's `-allow-insecure-no-client-auth`). Never expose a demo-mode signer to untrusted networks.
 
 ```bash
 go run ./cmd/relay-signer \
@@ -476,8 +491,8 @@ Consumers own the policy:
 
 - whether a binding is mandatory and what it means (relay stream, lease, hostname, tenant);
 - whether unvalidated transcript signing is forbidden (configure a `TranscriptValidator` to enforce it);
-- which ALPN/profile to expose, whether the signer deployment requires mTLS, and which
-  key/algorithm combinations are permitted.
+- which ALPN/profile to expose, whether the signer deployment requires mTLS, and any
+  additional KeyID-specific restrictions beyond supported key/algorithm pairs.
 
 A generic arbitrary-digest signing endpoint is deliberately absent: transcript binding is the
 library's core guarantee, not one deployment's hardening choice.
@@ -487,12 +502,22 @@ library's core guarantee, not one deployment's hardening choice.
 - Store private keys only in `relay-signer`; never distribute them to tunnel apps
 - Keep only the public certificate chain in tunnel apps
 - Enforce signer mTLS and pair it with `KeyID`-scoped ACLs
+- Signer sockets are bounded before TLS authentication: 256 concurrent connections globally, 64 per source IP.
+- The signer enforces a 5-second TLS handshake/header deadline, 10-second request-read deadline,
+  15-second write deadline, 30-second idle deadline, and 16 KiB maximum HTTP headers.
+- Applications can override these bounds via `server.Config.Limits`; zero values use the safe
+  defaults. Set the per-source connection cap for the peer addresses the signer actually sees:
+  behind a reverse proxy, that may be the proxy's IP rather than each original client.
 
 ### Signer API contract (`/v1/sign`)
 
 The signing protocol has a **single endpoint with a transcript-bound contract**. The request
 carries the TLS 1.3 handshake transcript; the signer validates it and returns the
 `CertificateVerify` signature. There is no arbitrary-digest signing endpoint.
+
+Only ECDSA P-256 keys accept `ECDSA_SHA256`, RSA keys accept `RSA_PSS_SHA256`,
+and Ed25519 keys accept `Ed25519`. A mismatched key and algorithm returns
+HTTP 400 without signing.
 
 Request:
 

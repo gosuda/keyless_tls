@@ -268,13 +268,13 @@ func TestHandshakeAdmission_RejectsBeforeTranscriptSigning(t *testing.T) {
 	}
 	remoteSigner := &countingTranscriptSigner{}
 	server, err := NewServer(Config{
-		CertPEM: certPEM,
-		KeyID: "key",
-		TranscriptSigner: remoteSigner,
-		MaxConcurrentHandshakes: 1,
-		MaxHandshakesPerSource: 1,
+		CertPEM:                      certPEM,
+		KeyID:                        "key",
+		TranscriptSigner:             remoteSigner,
+		MaxConcurrentHandshakes:      1,
+		MaxHandshakesPerSource:       1,
 		HandshakesPerSourcePerSecond: 1,
-		HandshakeBurstPerSource: 1,
+		HandshakeBurstPerSource:      1,
 	})
 	if err != nil {
 		t.Fatal(err)

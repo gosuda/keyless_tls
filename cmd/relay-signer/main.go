@@ -21,11 +21,11 @@ func main() {
 		clientCA                  = flag.String("client-ca", "", "client CA PEM path")
 		signKey                   = flag.String("sign-key", "", "keyless signing private key PEM path")
 		allowInsecureNoClientAuth = flag.Bool("allow-insecure-no-client-auth", false, "permit running without client certificate verification (-client-ca) (insecure/demo mode)")
-		maxSigns = flag.Int("max-signs", 32, "maximum concurrent private-key operations across all keys")
-		maxSignsPerKey = flag.Int("max-signs-per-key", 8, "maximum concurrent private-key operations per key")
-		maxClientConcurrent = flag.Int("max-client-concurrent", 4, "maximum concurrent requests per mTLS client")
-		clientRate = flag.Int("client-rate", 20, "maximum sustained sign requests per second per mTLS client")
-		clientBurst = flag.Int("client-burst", 40, "maximum burst requests per mTLS client")
+		maxSigns                  = flag.Int("max-signs", 32, "maximum concurrent private-key operations across all keys")
+		maxSignsPerKey            = flag.Int("max-signs-per-key", 8, "maximum concurrent private-key operations per key")
+		maxClientConcurrent       = flag.Int("max-client-concurrent", 4, "maximum concurrent requests per mTLS client")
+		clientRate                = flag.Int("client-rate", 20, "maximum sustained sign requests per second per mTLS client")
+		clientBurst               = flag.Int("client-burst", 40, "maximum burst requests per mTLS client")
 	)
 	flag.Parse()
 
@@ -41,7 +41,7 @@ func main() {
 		}
 		log.Println("WARNING: -client-ca not set and -allow-insecure-no-client-auth is enabled, mTLS client verification disabled")
 	}
-	log.Println("WARNING: no transcript validator is configured; any client that completes TLS client auth can obtain CertificateVerify signatures. Deployments that enforce binding semantics must run a signer with a TranscriptValidator.")
+	log.Println("WARNING: no transcript validator is configured; any client admitted by the signer transport can obtain CertificateVerify signatures. Deployments that enforce binding semantics must run a signer with a TranscriptValidator.")
 
 	certPEM := mustRead(*certPath)
 	keyPEM := mustRead(*keyPath)
@@ -65,18 +65,19 @@ func main() {
 	defer stop()
 
 	err = server.ListenAndServe(ctx, server.Config{
-		ListenAddr:    *listenAddr,
-		ServerCertPEM: certPEM,
-		ServerKeyPEM:  keyPEM,
-		ClientCAPEM:   caPEM,
+		ListenAddr:                *listenAddr,
+		ServerCertPEM:             certPEM,
+		ServerKeyPEM:              keyPEM,
+		ClientCAPEM:               caPEM,
+		AllowInsecureNoClientAuth: *allowInsecureNoClientAuth,
 		SignerService: &signer.Service{
-			Store: store,
-			MaxConcurrentSigns: *maxSigns,
+			Store:                    store,
+			MaxConcurrentSigns:       *maxSigns,
 			MaxConcurrentSignsPerKey: *maxSignsPerKey,
 		},
 		MaxConcurrentRequestsPerClient: *maxClientConcurrent,
-		RequestsPerClientPerSecond: *clientRate,
-		ClientBurst: *clientBurst,
+		RequestsPerClientPerSecond:     *clientRate,
+		ClientBurst:                    *clientBurst,
 	})
 	if err != nil {
 		log.Fatalf("signer server exited: %v", err)

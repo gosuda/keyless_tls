@@ -28,9 +28,9 @@ var ErrHandshakeOverloaded = errors.New("TLS handshake admission limit exceeded"
 
 const (
 	defaultConcurrentHandshakes = 64
-	defaultHandshakesPerSource = 8
-	defaultHandshakeRate = 20
-	defaultHandshakeBurst = 40
+	defaultHandshakesPerSource  = 8
+	defaultHandshakeRate        = 20
+	defaultHandshakeBurst       = 40
 )
 
 type Config struct {
@@ -48,17 +48,17 @@ type Config struct {
 	HandshakeTimeout time.Duration
 	// Handshake admission is shared by every connection from this Server,
 	// including NewConn, ServeConn, and Listener. Zero uses safe defaults.
-	MaxConcurrentHandshakes int
-	MaxHandshakesPerSource int
+	MaxConcurrentHandshakes      int
+	MaxHandshakesPerSource       int
 	HandshakesPerSourcePerSecond int
-	HandshakeBurstPerSource int
+	HandshakeBurstPerSource      int
 }
 
 type Server struct {
 	cfg Config
 
-	sigScheme uint16
-	sigAlg    string
+	sigScheme          uint16
+	sigAlg             string
 	handshakeAdmission *admission.Limiter
 }
 
@@ -120,11 +120,11 @@ func NewServer(cfg Config) (*Server, error) {
 		sigScheme: scheme,
 		sigAlg:    alg,
 		handshakeAdmission: admission.New(admission.Limits{
-			MaxConcurrent: total,
+			MaxConcurrent:  total,
 			MaxPerIdentity: perSource,
-			MaxIdentities: 4096,
-			RatePerSecond: rate,
-			Burst: burst,
+			MaxIdentities:  4096,
+			RatePerSecond:  rate,
+			Burst:          burst,
 		}),
 	}, nil
 }

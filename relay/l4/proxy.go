@@ -2,6 +2,7 @@ package l4
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -105,7 +106,8 @@ func (p *Proxy) handleConn(ctx context.Context, clientConn net.Conn) {
 		var info ClientHelloInfo
 		var parseErr error
 		info, forwardConn, parseErr = InspectClientHello(clientConn, p.ClientHelloTimeout)
-		if ctx.Err() != nil {
+		// Resource-bound violations cannot be routed to a fallback upstream.
+		if ctx.Err() != nil || errors.Is(parseErr, ErrTLSRecordTooLarge) || errors.Is(parseErr, ErrClientHelloTooLarge) {
 			return
 		}
 		upstream, err = p.DialByClientHello(ctx, info, parseErr)

@@ -15,3 +15,10 @@ func validateStoreDirectory(info os.FileInfo, _ bool) error {
 	}
 	return nil
 }
+
+func validateTemporaryFile(info os.FileInfo) error {
+	if !info.Mode().IsRegular() {
+		return errors.New("temporary lease file is not regular")
+	}
+	return nil
+}

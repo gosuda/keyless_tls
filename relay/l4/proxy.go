@@ -17,9 +17,9 @@ const (
 )
 
 type Proxy struct {
-	ListenAddr         string
-	DialTimeout        func(context.Context) (net.Conn, error)
-	DialByClientHello  func(context.Context, ClientHelloInfo, error) (net.Conn, error)
+	ListenAddr          string
+	DialTimeout         func(context.Context) (net.Conn, error)
+	DialByClientHello   func(context.Context, ClientHelloInfo, error) (net.Conn, error)
 	ClientHelloTimeout  time.Duration
 	MaxConnections      int
 	MaxConnectionsPerIP int

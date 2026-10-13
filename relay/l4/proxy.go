@@ -138,11 +138,11 @@ func (p *Proxy) handleConn(ctx context.Context, clientConn net.Conn) {
 }
 
 type admissionLimits struct {
-	mu          sync.Mutex
-	maxTotal    int
-	maxPerIP    int
-	total       int
-	perSource   map[string]int
+	mu        sync.Mutex
+	maxTotal  int
+	maxPerIP  int
+	total     int
+	perSource map[string]int
 }
 
 func newAdmissionLimits(maxTotal, maxPerIP int) *admissionLimits {

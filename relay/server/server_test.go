@@ -80,7 +80,7 @@ func TestSignServer_RejectsUnauthenticatedClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create server cert: %v", err)
 	}
-	clientCAPEM, _, err := testutil.GenerateCert("client.local", true)
+	clientCAPEM, clientCAKeyPEM, err := testutil.GenerateCert("client.local", true)
 	if err != nil {
 		t.Fatalf("create client CA cert: %v", err)
 	}
@@ -100,13 +100,14 @@ func TestSignServer_RejectsUnauthenticatedClient(t *testing.T) {
 	if !roots.AppendCertsFromPEM(serverCertPEM) {
 		t.Fatal("failed to trust server certificate")
 	}
+	clientTLSConfig := &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		RootCAs:    roots,
+		ServerName: "test.local",
+	}
 	client := &http.Client{
-		Timeout: 5 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{
-			MinVersion: tls.VersionTLS13,
-			RootCAs:    roots,
-			ServerName: "test.local",
-		}},
+		Timeout:   5 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: clientTLSConfig},
 	}
 	body, err := json.Marshal(signrpc.TranscriptSignRequest{
 		KeyID:               "relay-cert",
@@ -127,6 +128,27 @@ func TestSignServer_RejectsUnauthenticatedClient(t *testing.T) {
 	if err == nil {
 		resp.Body.Close()
 		t.Fatalf("unauthenticated client reached /v1/sign: HTTP %d", resp.StatusCode)
+	}
+
+	// Verify the same endpoint and server certificate work when a trusted
+	// client identity is supplied. The test CA also serves as the test identity.
+	clientIdentity, err := tls.X509KeyPair(clientCAPEM, clientCAKeyPEM)
+	if err != nil {
+		t.Fatalf("parse trusted client identity: %v", err)
+	}
+	authenticatedTLSConfig := clientTLSConfig.Clone()
+	authenticatedTLSConfig.Certificates = []tls.Certificate{clientIdentity}
+	authenticatedClient := &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: authenticatedTLSConfig},
+	}
+	resp, err = authenticatedClient.Post(ts.URL+signrpc.SignPath, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("authenticated request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("authenticated request status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
 }
 
@@ -154,9 +176,11 @@ func TestServerTLSConfig_InvalidCAPEM(t *testing.T) {
 		t.Fatalf("create server cert: %v", err)
 	}
 
-	_, err = serverTLSConfig(serverCertPEM, serverKeyPEM, []byte("not-valid-pem"), false)
-	if err == nil {
-		t.Fatal("expected error for invalid client CA PEM")
+	for _, allowInsecure := range []bool{false, true} {
+		_, err = serverTLSConfig(serverCertPEM, serverKeyPEM, []byte("not-valid-pem"), allowInsecure)
+		if err == nil {
+			t.Fatalf("expected invalid client CA error with insecure mode %t", allowInsecure)
+		}
 	}
 }
 

@@ -62,7 +62,7 @@ func main() {
 		ServerKeyPEM:              keyPEM,
 		ClientCAPEM:               caPEM,
 		AllowInsecureNoClientAuth: *allowInsecureNoClientAuth,
-		SignerService:              &signer.Service{
+		SignerService:             &signer.Service{
 			Store: store,
 		},
 	})

@@ -113,7 +113,11 @@ func TestLifecycleLoadCorruptionIsDeterministic(t *testing.T) {
 	}
 
 	store := manager.cfg.Store.(*DiskStore)
-	path := store.pathForLease("lease-corrupt")
+	revision, err := store.authority.LoadRevision(ctx, "lease-corrupt")
+	if err != nil {
+		t.Fatalf("load revision: %v", err)
+	}
+	path := store.pathForRevision("lease-corrupt", revision)
 	if err := os.WriteFile(path, []byte("corrupt"), 0o600); err != nil {
 		t.Fatalf("overwrite store file: %v", err)
 	}

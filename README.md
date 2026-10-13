@@ -444,8 +444,8 @@ Consumers own the policy:
 
 - whether a binding is mandatory and what it means (relay stream, lease, hostname, tenant);
 - whether unvalidated transcript signing is forbidden (configure a `TranscriptValidator` to enforce it);
-- which ALPN/profile to expose, whether the signer deployment requires mTLS, and which
-  key/algorithm combinations are permitted.
+- which ALPN/profile to expose, whether the signer deployment requires mTLS, and any
+  additional KeyID-specific restrictions beyond supported key/algorithm pairs.
 
 A generic arbitrary-digest signing endpoint is deliberately absent: transcript binding is the
 library's core guarantee, not one deployment's hardening choice.
@@ -461,6 +461,10 @@ library's core guarantee, not one deployment's hardening choice.
 The signing protocol has a **single endpoint with a transcript-bound contract**. The request
 carries the TLS 1.3 handshake transcript; the signer validates it and returns the
 `CertificateVerify` signature. There is no arbitrary-digest signing endpoint.
+
+Only ECDSA P-256 keys accept `ECDSA_SHA256`, RSA keys accept `RSA_PSS_SHA256`,
+and Ed25519 keys accept `Ed25519`. A mismatched key and algorithm returns
+HTTP 400 without signing.
 
 Request:
 

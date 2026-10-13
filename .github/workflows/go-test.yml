@@ -3,7 +3,7 @@ name: Go tests
 on:
   push:
     branches:
-      - fix/lifecycle-disk-rollback-protection
+      - main
   pull_request:
 
 permissions:

@@ -354,6 +354,16 @@ Useful `cmd/relay-l4` route-mode flags:
 - `-default-upstream`: fallback target for unknown visible SNI, including ECH outer SNI misses
 - `-allow-parse-error`: allow non-TLS/invalid ClientHello to use fallback
 - `-clienthello-timeout`: maximum ClientHello inspection time
+- `-max-connections`: relay-wide concurrent client limit (default: 1024)
+- `-max-connections-per-ip`: concurrent client limit per source IP (default: 64)
+- `-idle-timeout`: close a forwarded connection after no traffic in either direction (default: 5m)
+
+The L4 relay also caps each plaintext TLS record at 16 KiB and buffers no more than
+64 KiB of fragmented ClientHello handshake data (128 KiB of captured wire data).
+Oversized handshakes are rejected even when `-allow-parse-error` is enabled.
+Connections that exceed either admission limit are closed without contacting an upstream.
+Active client/upstream connections are closed when the relay stops.
+
 
 ### Example app: one relay routing 10 target hosts
 

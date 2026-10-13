@@ -30,9 +30,9 @@ type DiskStore struct {
 }
 
 type leaseCheckpoint struct {
-	LeaseID string              `json:"lease_id"`
-	Epoch   int                 `json:"epoch"`
-	Digest  [sha256.Size]byte    `json:"digest"`
+	LeaseID string           `json:"lease_id"`
+	Epoch   int              `json:"epoch"`
+	Digest  [sha256.Size]byte `json:"digest"`
 }
 
 // NewDiskStore requires an independently authoritative checkpoint directory.

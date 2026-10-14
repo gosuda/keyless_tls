@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -34,6 +35,9 @@ func TestInspectClientHello_SuccessAndReplay(t *testing.T) {
 	}
 	if got := len(info.ALPNProtocols); got != 2 {
 		t.Fatalf("ALPN protocol count = %d, want 2", got)
+	}
+	if !bytes.Equal(info.HandshakeMessage, record[tlsRecordHeaderLen:]) {
+		t.Fatal("handshake message does not match original ClientHello handshake bytes")
 	}
 
 	replayed := make([]byte, len(record)+len(tail))
@@ -312,4 +316,130 @@ func appendClientHelloExtension(t *testing.T, record []byte, extType uint16, ext
 	out[extLenOffset+1] = byte(extLen)
 
 	return out
+}
+
+func splitBytes(b []byte, parts int) [][]byte {
+	out := make([][]byte, 0, parts)
+	size := (len(b) + parts - 1) / parts
+	for len(b) > 0 {
+		n := size
+		if n > len(b) {
+			n = len(b)
+		}
+		out = append(out, b[:n])
+		b = b[n:]
+	}
+	return out
+}
+
+func TestInspectClientHello_HandshakeMessage_Fragmented(t *testing.T) {
+	record := captureClientHelloRecord(t, "fragmented-span.example.com", []string{"h2", "http/1.1"})
+	expectedHandshake := record[tlsRecordHeaderLen:]
+
+	for _, parts := range []int{2, 3, 5} {
+		t.Run(fmt.Sprintf("parts_%d", parts), func(t *testing.T) {
+			var wire []byte
+			for _, chunk := range splitBytes(expectedHandshake, parts) {
+				wire = append(wire, testHandshakeRecord(record[:tlsRecordHeaderLen], chunk)...)
+			}
+			tail := []byte("TAIL")
+			wire = append(wire, tail...)
+
+			client, server := net.Pipe()
+			defer client.Close()
+
+			go func() {
+				defer client.Close()
+				_, _ = client.Write(wire)
+			}()
+
+			info, wrapped, err := InspectClientHello(server, time.Second)
+			if err != nil {
+				t.Fatalf("InspectClientHello() error = %v", err)
+			}
+			defer wrapped.Close()
+
+			if got, want := info.ServerName, "fragmented-span.example.com"; got != want {
+				t.Fatalf("server name = %q, want %q", got, want)
+			}
+			if !bytes.Equal(info.HandshakeMessage, expectedHandshake) {
+				t.Fatal("handshake message does not match expected assembled ClientHello bytes")
+			}
+
+			replayed := make([]byte, len(wire))
+			if _, err := io.ReadFull(wrapped, replayed); err != nil {
+				t.Fatalf("read replayed bytes: %v", err)
+			}
+			if !bytes.Equal(replayed, wire) {
+				t.Fatal("replayed bytes do not match original payload")
+			}
+		})
+	}
+}
+
+func TestInspectClientHello_HandshakeMessage_ExcludesExtraBytes(t *testing.T) {
+	record := captureClientHelloRecord(t, "extra.example.com", []string{"h2"})
+	expectedHandshake := record[tlsRecordHeaderLen:]
+
+	// Extra bytes appended within the same TLS record body after declared ClientHello length
+	extraBytes := []byte("TRAILING_HANDSHAKE_DATA")
+	bodyWithExtra := append(append([]byte(nil), expectedHandshake...), extraBytes...)
+	recordWithExtra := testHandshakeRecord(record[:tlsRecordHeaderLen], bodyWithExtra)
+	wire1 := append(recordWithExtra, []byte("STREAM_TAIL")...)
+
+	client, server := net.Pipe()
+	defer client.Close()
+
+	go func() {
+		defer client.Close()
+		_, _ = client.Write(wire1)
+	}()
+
+	info, wrapped, err := InspectClientHello(server, time.Second)
+	if err != nil {
+		t.Fatalf("InspectClientHello() error = %v", err)
+	}
+	defer wrapped.Close()
+
+	if !bytes.Equal(info.HandshakeMessage, expectedHandshake) {
+		t.Fatalf("HandshakeMessage included extra bytes: got %d bytes, want %d bytes", len(info.HandshakeMessage), len(expectedHandshake))
+	}
+
+	replayed := make([]byte, len(wire1))
+	if _, err := io.ReadFull(wrapped, replayed); err != nil {
+		t.Fatalf("read replayed bytes: %v", err)
+	}
+	if !bytes.Equal(replayed, wire1) {
+		t.Fatal("replayed bytes mismatch")
+	}
+
+	// Extra bytes in a second record following ClientHello record
+	record2 := testHandshakeRecord(record[:tlsRecordHeaderLen], []byte("ANOTHER_RECORD"))
+	wire2 := append(append([]byte(nil), record...), record2...)
+
+	client2, server2 := net.Pipe()
+	defer client2.Close()
+
+	go func() {
+		defer client2.Close()
+		_, _ = client2.Write(wire2)
+	}()
+
+	info2, wrapped2, err := InspectClientHello(server2, time.Second)
+	if err != nil {
+		t.Fatalf("InspectClientHello() error = %v", err)
+	}
+	defer wrapped2.Close()
+
+	if !bytes.Equal(info2.HandshakeMessage, expectedHandshake) {
+		t.Fatalf("HandshakeMessage mismatch: got %d bytes, want %d bytes", len(info2.HandshakeMessage), len(expectedHandshake))
+	}
+
+	replayed2 := make([]byte, len(wire2))
+	if _, err := io.ReadFull(wrapped2, replayed2); err != nil {
+		t.Fatalf("read replayed bytes: %v", err)
+	}
+	if !bytes.Equal(replayed2, wire2) {
+		t.Fatal("replayed bytes mismatch")
+	}
 }

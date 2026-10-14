@@ -97,6 +97,9 @@ func TestInspectClientHelloReassemblesFragmentedHandshake(t *testing.T) {
 	if len(info.ALPNProtocols) != 1 || info.ALPNProtocols[0] != "h2" {
 		t.Fatalf("ALPN = %v", info.ALPNProtocols)
 	}
+	if !bytes.Equal(info.HandshakeMessage, body) {
+		t.Fatal("fragmented ClientHello handshake message mismatch")
+	}
 
 	got := make([]byte, len(payload))
 	if _, err := io.ReadFull(replay, got); err != nil {

@@ -39,8 +39,12 @@ type ClientHelloInfo struct {
 	// encrypted_client_hello extension. In that case ServerName is the outer
 	// public name, not the encrypted inner SNI.
 	ECHOffered bool
-	ClientAddr net.Addr
-	LocalAddr  net.Addr
+	// HandshakeMessage contains the exact reassembled ClientHello handshake
+	// message, including the 4-byte handshake header but excluding TLS record
+	// headers and any bytes after the declared ClientHello length.
+	HandshakeMessage []byte
+	ClientAddr       net.Addr
+	LocalAddr        net.Addr
 }
 
 func InspectClientHello(conn net.Conn, timeout time.Duration) (ClientHelloInfo, net.Conn, error) {
@@ -110,7 +114,8 @@ func InspectClientHello(conn net.Conn, timeout time.Duration) (ClientHelloInfo, 
 			continue
 		}
 
-		info, err := parseClientHelloRecord(handshake)
+		info, err := parseClientHelloRecord(handshake[:4+msgLen])
+		info.HandshakeMessage = handshake[:4+msgLen]
 		info.ClientAddr = conn.RemoteAddr()
 		info.LocalAddr = conn.LocalAddr()
 		return info, prependConn(conn, captured), err

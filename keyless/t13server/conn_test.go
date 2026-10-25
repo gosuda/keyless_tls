@@ -31,7 +31,7 @@ func TestConn_PostHandshakeHandshakeMessageRejected(t *testing.T) {
 	}
 
 	conn := &Conn{
-		raw: c1,
+		in: recordReader{r: c1},
 		sess: &session{
 			inCipher:  inCipher,
 			outCipher: outCipher,
@@ -74,7 +74,7 @@ func TestConn_UnsupportedInnerTypeRejected(t *testing.T) {
 	}
 
 	conn := &Conn{
-		raw: c1,
+		in: recordReader{r: c1},
 		sess: &session{
 			inCipher:  inCipher,
 			outCipher: outCipher,
@@ -114,7 +114,7 @@ func TestConn_ZeroLengthApplicationDataRecordSkipped(t *testing.T) {
 	}
 
 	conn := &Conn{
-		raw: c1,
+		in: recordReader{r: c1},
 		sess: &session{
 			inCipher:  inCipher,
 			outCipher: outCipher,
@@ -162,7 +162,7 @@ func TestConn_ReadEncryptedHandshakeMessageReassemblesFragments(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	conn := &Conn{raw: c1}
+	conn := &Conn{in: recordReader{r: c1}}
 
 	body := make([]byte, 40000)
 	for i := range body {
@@ -227,7 +227,7 @@ func TestConn_ReadEncryptedHandshakeMessageRejectsOversize(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	conn := &Conn{raw: c1}
+	conn := &Conn{in: recordReader{r: c1}}
 
 	go func() {
 		defer c2.Close()

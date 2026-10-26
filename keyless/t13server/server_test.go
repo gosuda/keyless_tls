@@ -1402,6 +1402,233 @@ func TestTLS13Server_CallerDeadlinePreservedAfterHandshake(t *testing.T) {
 	}
 }
 
+// captureWritesConn passes writes through until capture is set and keeps
+// them afterwards, so a test can deliver a client record to the server in
+// pieces of its choosing.
+type captureWritesConn struct {
+	net.Conn
+	capture  bool
+	captured []byte
+}
+
+func (c *captureWritesConn) Write(b []byte) (int, error) {
+	if c.capture {
+		c.captured = append(c.captured, b...)
+		return len(b), nil
+	}
+	return c.Conn.Write(b)
+}
+
+// failNextReadConn returns err from its next Read, once.
+type failNextReadConn struct {
+	net.Conn
+	err error
+}
+
+func (c *failNextReadConn) Read(b []byte) (int, error) {
+	if err := c.err; err != nil {
+		c.err = nil
+		return 0, err
+	}
+	return c.Conn.Read(b)
+}
+
+// handshakeOverPipe completes a handshake between a crypto/tls client on
+// clientRaw and a t13server connection on serverRaw.
+func handshakeOverPipe(t *testing.T, clientRaw, serverRaw net.Conn) (*tls.Conn, *t13server.Conn) {
+	t.Helper()
+	certPEM, keyPEM, err := testutil.GenerateCert("example.com", false)
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+	priv, err := parseECDSAPrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("parse key: %v", err)
+	}
+	srv, err := t13server.NewServer(t13server.Config{
+		CertPEM:          certPEM,
+		KeyID:            "test-key",
+		TranscriptSigner: &signer.Service{Store: &mockCryptoSignerStore{priv: priv}},
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	rootPool := x509.NewCertPool()
+	rootPool.AppendCertsFromPEM(certPEM)
+	client := tls.Client(clientRaw, &tls.Config{
+		ServerName: "example.com",
+		RootCAs:    rootPool,
+		MinVersion: tls.VersionTLS13,
+	})
+	serverConn := srv.NewConn(serverRaw, nil)
+
+	hsErrCh := make(chan error, 2)
+	go func() {
+		hsErrCh <- client.Handshake()
+	}()
+	go func() {
+		hsErrCh <- serverConn.HandshakeContext(context.Background())
+	}()
+	for range 2 {
+		if err := <-hsErrCh; err != nil {
+			t.Fatalf("handshake failed: %v", err)
+		}
+	}
+	return client, serverConn
+}
+
+type readResult struct {
+	data string
+	err  error
+}
+
+func startRead(conn net.Conn) <-chan readResult {
+	ch := make(chan readResult, 1)
+	go func() {
+		buf := make([]byte, 64)
+		n, err := conn.Read(buf)
+		ch <- readResult{data: string(buf[:n]), err: err}
+	}()
+	return ch
+}
+
+func awaitRead(t *testing.T, ch <-chan readResult) readResult {
+	t.Helper()
+	select {
+	case res := <-ch:
+		return res
+	case <-time.After(5 * time.Second):
+		t.Fatal("Read did not return")
+		return readResult{}
+	}
+}
+
+func TestConn_ReadDeadlineMidRecordKeepsPartialRecord(t *testing.T) {
+	tests := []struct {
+		name string
+		cuts []int // record bytes that have arrived each time a deadline fires
+	}{
+		{name: "inside header", cuts: []int{3}},
+		{name: "inside payload", cuts: []int{10}},
+		{name: "several times in one record", cuts: []int{2, 5, 9, 20}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clientRaw, serverRaw := net.Pipe()
+			defer clientRaw.Close()
+			defer serverRaw.Close()
+
+			clientWire := &captureWritesConn{Conn: clientRaw}
+			client, serverConn := handshakeOverPipe(t, clientWire, serverRaw)
+
+			clientWire.capture = true
+			if _, err := client.Write([]byte("hello")); err != nil {
+				t.Fatalf("client write: %v", err)
+			}
+			record := clientWire.captured
+
+			delivered := 0
+			for _, cut := range tt.cuts {
+				// net.Pipe returns from Write only once the reader has taken
+				// every byte, so this part is with the server before the
+				// deadline.
+				read := startRead(serverConn)
+				if _, err := clientRaw.Write(record[delivered:cut]); err != nil {
+					t.Fatalf("deliver bytes %d-%d: %v", delivered, cut, err)
+				}
+				delivered = cut
+				if err := serverConn.SetReadDeadline(time.Now()); err != nil {
+					t.Fatalf("set read deadline: %v", err)
+				}
+				res := awaitRead(t, read)
+				var netErr net.Error
+				if !errors.As(res.err, &netErr) || !netErr.Timeout() {
+					t.Fatalf("Read past the deadline with %d bytes = (%q, %v), want a timeout", cut, res.data, res.err)
+				}
+				if err := serverConn.SetReadDeadline(time.Time{}); err != nil {
+					t.Fatalf("clear read deadline: %v", err)
+				}
+			}
+
+			read := startRead(serverConn)
+			go func() {
+				_, _ = clientRaw.Write(record[delivered:])
+			}()
+			res := awaitRead(t, read)
+			if res.err != nil || res.data != "hello" {
+				t.Fatalf("Read after clearing the deadline = (%q, %v), want %q", res.data, res.err, "hello")
+			}
+		})
+	}
+}
+
+func TestConn_EOFInsideRecordIsUnexpected(t *testing.T) {
+	tests := []struct {
+		name string
+		cut  int // record bytes that arrive before the peer closes
+		want error
+	}{
+		{name: "at a record boundary", cut: 0, want: io.EOF},
+		{name: "inside header", cut: 3, want: io.ErrUnexpectedEOF},
+		{name: "right after the header", cut: 5, want: io.ErrUnexpectedEOF},
+		{name: "inside payload", cut: 10, want: io.ErrUnexpectedEOF},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clientRaw, serverRaw := net.Pipe()
+			defer serverRaw.Close()
+
+			clientWire := &captureWritesConn{Conn: clientRaw}
+			client, serverConn := handshakeOverPipe(t, clientWire, serverRaw)
+
+			clientWire.capture = true
+			if _, err := client.Write([]byte("hello")); err != nil {
+				t.Fatalf("client write: %v", err)
+			}
+			record := clientWire.captured
+
+			read := startRead(serverConn)
+			if tt.cut > 0 {
+				if _, err := clientRaw.Write(record[:tt.cut]); err != nil {
+					t.Fatalf("deliver first part: %v", err)
+				}
+			}
+			_ = clientRaw.Close()
+			if res := awaitRead(t, read); !errors.Is(res.err, tt.want) {
+				t.Fatalf("Read after the peer closed = (%q, %v), want %v", res.data, res.err, tt.want)
+			}
+		})
+	}
+}
+
+func TestConn_NonTimeoutReadErrorIsSticky(t *testing.T) {
+	clientRaw, serverRaw := net.Pipe()
+	defer clientRaw.Close()
+	defer serverRaw.Close()
+
+	serverWire := &failNextReadConn{Conn: serverRaw}
+	client, serverConn := handshakeOverPipe(t, clientRaw, serverWire)
+
+	errInjected := errors.New("injected read failure")
+	serverWire.err = errInjected
+	if _, err := serverConn.Read(make([]byte, 64)); !errors.Is(err, errInjected) {
+		t.Fatalf("Read error = %v, want %v", err, errInjected)
+	}
+
+	// A whole record is available now, but a failed connection must not
+	// resume reading.
+	go func() {
+		_, _ = client.Write([]byte("hello"))
+	}()
+	res := awaitRead(t, startRead(serverConn))
+	if !errors.Is(res.err, errInjected) {
+		t.Fatalf("Read after a failed Read = (%q, %v), want %v again", res.data, res.err, errInjected)
+	}
+}
+
 // blockingSigner records whether it received a context carrying a deadline,
 // then blocks until that context is done and returns its error.
 type blockingSigner struct {

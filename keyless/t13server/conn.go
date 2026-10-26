@@ -38,7 +38,12 @@ type Conn struct {
 	stateMu sync.Mutex
 	sess    *session
 
+	// in is the only reader of raw: the handshake reads through it first,
+	// and Read only after ensureHandshake, under readMu. readErr is the first
+	// Read failure other than a timeout; every later Read returns it.
 	readMu  sync.Mutex
+	in      recordReader
+	readErr error
 	readBuf []byte
 
 	writeMu sync.Mutex
@@ -70,6 +75,7 @@ func newConn(raw net.Conn, binding []byte, s *Server, timeout time.Duration) *Co
 	copy(bindingCopy, binding)
 	return &Conn{
 		raw:              raw,
+		in:               recordReader{r: raw},
 		binding:          bindingCopy,
 		server:           s,
 		handshakeTimeout: timeout,
@@ -261,10 +267,19 @@ func (c *Conn) Read(b []byte) (int, error) {
 	if err := c.ensureHandshake(); err != nil {
 		return 0, err
 	}
+	if c.readErr != nil {
+		return 0, c.readErr
+	}
 
 	for len(c.readBuf) == 0 {
-		innerType, payload, err := c.sess.inCipher.decryptRecord(c.raw)
+		innerType, payload, err := c.sess.inCipher.decryptRecord(&c.in)
 		if err != nil {
+			// A timeout keeps a partly received record in c.in for the next
+			// Read, as crypto/tls does. Any other failure ends the read side.
+			var netErr net.Error
+			if !errors.As(err, &netErr) || !netErr.Timeout() {
+				c.readErr = err
+			}
 			return 0, err
 		}
 		if innerType == recordTypeApplicationData {
@@ -279,9 +294,11 @@ func (c *Conn) Read(b []byte) (int, error) {
 			if len(payload) > 0 {
 				msgType = payload[0]
 			}
-			return 0, fmt.Errorf("tls: unsupported post-handshake handshake message type 0x%02x", msgType)
+			c.readErr = fmt.Errorf("tls: unsupported post-handshake handshake message type 0x%02x", msgType)
+			return 0, c.readErr
 		}
-		return 0, fmt.Errorf("tls: unsupported record inner type 0x%02x", innerType)
+		c.readErr = fmt.Errorf("tls: unsupported record inner type 0x%02x", innerType)
+		return 0, c.readErr
 	}
 
 	n := copy(b, c.readBuf)
@@ -389,7 +406,7 @@ func (c *Conn) writeEncryptedHandshakeMessage(cipher *recordCipher, msg []byte) 
 func (c *Conn) readEncryptedHandshakeMessage(cipher *recordCipher) ([]byte, error) {
 	var msgBuf []byte
 	for {
-		innerType, payload, err := cipher.decryptRecord(c.raw)
+		innerType, payload, err := cipher.decryptRecord(&c.in)
 		if err != nil {
 			return nil, err
 		}
@@ -413,7 +430,7 @@ func (c *Conn) readEncryptedHandshakeMessage(cipher *recordCipher) ([]byte, erro
 
 func (c *Conn) handshake(ctx context.Context, s *Server) error {
 	// 1. Read ClientHello (accumulated across record boundaries)
-	chPayload, err := readPlaintextHandshakeMessage(c.raw)
+	chPayload, err := readPlaintextHandshakeMessage(&c.in)
 	if err != nil {
 		return fmt.Errorf("read client hello: %w", err)
 	}

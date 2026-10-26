@@ -31,7 +31,7 @@ func TestConn_PostHandshakeHandshakeMessageRejected(t *testing.T) {
 	}
 
 	conn := &Conn{
-		raw: c1,
+		in: recordReader{r: c1},
 		sess: &session{
 			inCipher:  inCipher,
 			outCipher: outCipher,
@@ -55,6 +55,7 @@ func TestConn_PostHandshakeHandshakeMessageRejected(t *testing.T) {
 	if !strings.Contains(err.Error(), "unsupported post-handshake handshake message type 0x18") {
 		t.Fatalf("unexpected error message: %v", err)
 	}
+	assertReadFailsAgain(t, conn, c2, outCipher, err)
 }
 
 func TestConn_UnsupportedInnerTypeRejected(t *testing.T) {
@@ -74,7 +75,7 @@ func TestConn_UnsupportedInnerTypeRejected(t *testing.T) {
 	}
 
 	conn := &Conn{
-		raw: c1,
+		in: recordReader{r: c1},
 		sess: &session{
 			inCipher:  inCipher,
 			outCipher: outCipher,
@@ -95,6 +96,23 @@ func TestConn_UnsupportedInnerTypeRejected(t *testing.T) {
 	if !strings.Contains(err.Error(), "unsupported record inner type 0x99") {
 		t.Fatalf("unexpected error message: %v", err)
 	}
+	assertReadFailsAgain(t, conn, c2, outCipher, err)
+}
+
+// assertReadFailsAgain offers a valid application data record after a
+// rejected one and checks that the connection stays failed: the next Read
+// returns the same error instead of the data.
+func assertReadFailsAgain(t *testing.T, conn *Conn, peer net.Conn, outCipher *recordCipher, want error) {
+	t.Helper()
+	go func() {
+		rec, _ := outCipher.encryptRecord(recordTypeApplicationData, []byte("after"))
+		_, _ = peer.Write(rec)
+	}()
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	if err == nil || err.Error() != want.Error() {
+		t.Fatalf("Read after the rejection = (%q, %v), want %v again", buf[:n], err, want)
+	}
 }
 
 func TestConn_ZeroLengthApplicationDataRecordSkipped(t *testing.T) {
@@ -114,7 +132,7 @@ func TestConn_ZeroLengthApplicationDataRecordSkipped(t *testing.T) {
 	}
 
 	conn := &Conn{
-		raw: c1,
+		in: recordReader{r: c1},
 		sess: &session{
 			inCipher:  inCipher,
 			outCipher: outCipher,
@@ -162,7 +180,7 @@ func TestConn_ReadEncryptedHandshakeMessageReassemblesFragments(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	conn := &Conn{raw: c1}
+	conn := &Conn{in: recordReader{r: c1}}
 
 	body := make([]byte, 40000)
 	for i := range body {
@@ -227,7 +245,7 @@ func TestConn_ReadEncryptedHandshakeMessageRejectsOversize(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	conn := &Conn{raw: c1}
+	conn := &Conn{in: recordReader{r: c1}}
 
 	go func() {
 		defer c2.Close()

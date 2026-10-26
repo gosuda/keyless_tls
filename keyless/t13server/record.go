@@ -15,6 +15,7 @@ const (
 	recordTypeHandshake        = 0x16
 	recordTypeApplicationData  = 0x17
 
+	recordHeaderLen           = 5
 	maxPlaintextLength        = 16384 // 2^14 bytes
 	maxCiphertextLength       = 16384 + 256
 	maxHandshakeMessageLength = 65536
@@ -25,6 +26,54 @@ var (
 	errBadRecordLength = errors.New("record length exceeds maximum")
 	errClosedRecord    = errors.New("tls connection closed by peer")
 )
+
+// recordReader reads whole TLS records from r. Received bytes stay in buf
+// until their record has arrived in full, so a Read of r that fails part way
+// through a record, such as on a read deadline, loses nothing: the next call
+// resumes that record. A Conn's handshake and Read both go through its one
+// recordReader, so nothing else reads the raw connection.
+type recordReader struct {
+	r   io.Reader
+	buf []byte // received prefix of the next record
+}
+
+// next returns the header and payload of the next record. Both alias the
+// reader's buffer and are valid only until the following call.
+func (rr *recordReader) next() (header, payload []byte, err error) {
+	if err := rr.fill(recordHeaderLen); err != nil {
+		return nil, nil, err
+	}
+	length := int(binary.BigEndian.Uint16(rr.buf[3:recordHeaderLen]))
+	if length > maxCiphertextLength {
+		return nil, nil, errBadRecordLength
+	}
+	if err := rr.fill(recordHeaderLen + length); err != nil {
+		return nil, nil, err
+	}
+	record := rr.buf
+	rr.buf = rr.buf[:0]
+	return record[:recordHeaderLen], record[recordHeaderLen:], nil
+}
+
+// fill reads from r until the first n bytes of the record are buffered.
+func (rr *recordReader) fill(n int) error {
+	if cap(rr.buf) < n {
+		grown := make([]byte, len(rr.buf), n)
+		copy(grown, rr.buf)
+		rr.buf = grown
+	}
+	for len(rr.buf) < n {
+		m, err := rr.r.Read(rr.buf[len(rr.buf):n])
+		rr.buf = rr.buf[:len(rr.buf)+m]
+		if err != nil && len(rr.buf) < n {
+			if err == io.EOF && len(rr.buf) > 0 {
+				err = io.ErrUnexpectedEOF
+			}
+			return err
+		}
+	}
+	return nil
+}
 
 type recordCipher struct {
 	aead cipher.AEAD
@@ -74,37 +123,27 @@ func (rc *recordCipher) encryptRecord(innerContentType byte, plaintext []byte) (
 	rc.seq++
 
 	ciphertextLen := len(payloadWithInner) + rc.aead.Overhead()
-	header := [5]byte{
+	header := [recordHeaderLen]byte{
 		recordTypeApplicationData,
 		0x03, 0x03, // Legacy TLS 1.2 version
 		byte(ciphertextLen >> 8),
 		byte(ciphertextLen),
 	}
 
-	record := make([]byte, 5, 5+ciphertextLen)
+	record := make([]byte, recordHeaderLen, recordHeaderLen+ciphertextLen)
 	copy(record, header[:])
 	record = rc.aead.Seal(record, nonce, payloadWithInner, header[:])
 	return record, nil
 }
 
-func (rc *recordCipher) decryptRecord(r io.Reader) (byte, []byte, error) {
+func (rc *recordCipher) decryptRecord(rr *recordReader) (byte, []byte, error) {
 	for {
-		var header [5]byte
-		if _, err := io.ReadFull(r, header[:]); err != nil {
+		header, payload, err := rr.next()
+		if err != nil {
 			return 0, nil, err
 		}
 
 		recType := header[0]
-		length := binary.BigEndian.Uint16(header[3:5])
-		if length > maxCiphertextLength {
-			return 0, nil, errBadRecordLength
-		}
-
-		payload := make([]byte, length)
-		if _, err := io.ReadFull(r, payload); err != nil {
-			return 0, nil, err
-		}
-
 		// Middlebox compatibility dummy ChangeCipherSpec record: ignore and read next
 		if recType == recordTypeChangeCipherSpec {
 			continue
@@ -125,7 +164,7 @@ func (rc *recordCipher) decryptRecord(r io.Reader) (byte, []byte, error) {
 		nonce := rc.computeNonce()
 		rc.seq++
 
-		plaintextWithInner, err := rc.aead.Open(nil, nonce, payload, header[:])
+		plaintextWithInner, err := rc.aead.Open(nil, nonce, payload, header)
 		if err != nil {
 			return 0, nil, fmt.Errorf("aead decrypt: %w", err)
 		}
@@ -153,25 +192,16 @@ func (rc *recordCipher) decryptRecord(r io.Reader) (byte, []byte, error) {
 	}
 }
 
-// readPlaintextRecord reads an unencrypted TLS record (such as initial ClientHello).
-func readPlaintextRecord(r io.Reader) (byte, []byte, error) {
+// readPlaintextRecord reads an unencrypted TLS record (such as initial
+// ClientHello). The payload aliases rr's buffer, as in recordReader.next.
+func readPlaintextRecord(rr *recordReader) (byte, []byte, error) {
 	for {
-		var header [5]byte
-		if _, err := io.ReadFull(r, header[:]); err != nil {
+		header, payload, err := rr.next()
+		if err != nil {
 			return 0, nil, err
 		}
 
 		recType := header[0]
-		length := binary.BigEndian.Uint16(header[3:5])
-		if length > maxCiphertextLength {
-			return 0, nil, errBadRecordLength
-		}
-
-		payload := make([]byte, length)
-		if _, err := io.ReadFull(r, payload); err != nil {
-			return 0, nil, err
-		}
-
 		if recType == recordTypeChangeCipherSpec {
 			continue
 		}
@@ -180,13 +210,13 @@ func readPlaintextRecord(r io.Reader) (byte, []byte, error) {
 	}
 }
 
-// readPlaintextHandshakeMessage reads plaintext TLS records from r until a complete
+// readPlaintextHandshakeMessage reads plaintext TLS records from rr until a complete
 // handshake message is accumulated across record boundaries.
 // It skips middlebox compatibility ChangeCipherSpec records.
-func readPlaintextHandshakeMessage(r io.Reader) ([]byte, error) {
+func readPlaintextHandshakeMessage(rr *recordReader) ([]byte, error) {
 	var msgBuf []byte
 	for {
-		recType, recPayload, err := readPlaintextRecord(r)
+		recType, recPayload, err := readPlaintextRecord(rr)
 		if err != nil {
 			return nil, err
 		}
@@ -210,11 +240,11 @@ func readPlaintextHandshakeMessage(r io.Reader) ([]byte, error) {
 
 // formatPlaintextRecord wraps plaintext into a TLS record with the given record type.
 func formatPlaintextRecord(recType byte, payload []byte) []byte {
-	out := make([]byte, 5+len(payload))
+	out := make([]byte, recordHeaderLen+len(payload))
 	out[0] = recType
 	out[1] = 0x03
 	out[2] = 0x03
-	binary.BigEndian.PutUint16(out[3:5], uint16(len(payload)))
-	copy(out[5:], payload)
+	binary.BigEndian.PutUint16(out[3:recordHeaderLen], uint16(len(payload)))
+	copy(out[recordHeaderLen:], payload)
 	return out
 }

@@ -30,9 +30,8 @@ var (
 // recordReader reads whole TLS records from r. Received bytes stay in buf
 // until their record has arrived in full, so a Read of r that fails part way
 // through a record, such as on a read deadline, loses nothing: the next call
-// resumes that record. It never reads past the record it is assembling, so a
-// Conn's handshake and application data share one recordReader without
-// either side holding bytes that belong to the other.
+// resumes that record. A Conn's handshake and Read both go through its one
+// recordReader, so nothing else reads the raw connection.
 type recordReader struct {
 	r   io.Reader
 	buf []byte // received prefix of the next record
@@ -124,14 +123,14 @@ func (rc *recordCipher) encryptRecord(innerContentType byte, plaintext []byte) (
 	rc.seq++
 
 	ciphertextLen := len(payloadWithInner) + rc.aead.Overhead()
-	header := [5]byte{
+	header := [recordHeaderLen]byte{
 		recordTypeApplicationData,
 		0x03, 0x03, // Legacy TLS 1.2 version
 		byte(ciphertextLen >> 8),
 		byte(ciphertextLen),
 	}
 
-	record := make([]byte, 5, 5+ciphertextLen)
+	record := make([]byte, recordHeaderLen, recordHeaderLen+ciphertextLen)
 	copy(record, header[:])
 	record = rc.aead.Seal(record, nonce, payloadWithInner, header[:])
 	return record, nil
@@ -241,11 +240,11 @@ func readPlaintextHandshakeMessage(rr *recordReader) ([]byte, error) {
 
 // formatPlaintextRecord wraps plaintext into a TLS record with the given record type.
 func formatPlaintextRecord(recType byte, payload []byte) []byte {
-	out := make([]byte, 5+len(payload))
+	out := make([]byte, recordHeaderLen+len(payload))
 	out[0] = recType
 	out[1] = 0x03
 	out[2] = 0x03
-	binary.BigEndian.PutUint16(out[3:5], uint16(len(payload)))
-	copy(out[5:], payload)
+	binary.BigEndian.PutUint16(out[3:recordHeaderLen], uint16(len(payload)))
+	copy(out[recordHeaderLen:], payload)
 	return out
 }

@@ -1506,11 +1506,12 @@ func awaitRead(t *testing.T, ch <-chan readResult) readResult {
 
 func TestConn_ReadDeadlineMidRecordKeepsPartialRecord(t *testing.T) {
 	tests := []struct {
-		name  string
-		split int // record bytes that arrive before the deadline fires
+		name string
+		cuts []int // record bytes that have arrived each time a deadline fires
 	}{
-		{name: "inside header", split: 3},
-		{name: "inside payload", split: 10},
+		{name: "inside header", cuts: []int{3}},
+		{name: "inside payload", cuts: []int{10}},
+		{name: "several times in one record", cuts: []int{2, 5, 9, 20}},
 	}
 
 	for _, tt := range tests {
@@ -1528,31 +1529,76 @@ func TestConn_ReadDeadlineMidRecordKeepsPartialRecord(t *testing.T) {
 			}
 			record := clientWire.captured
 
-			// net.Pipe returns from Write only once the reader has taken every
-			// byte, so the first part is with the server before the deadline.
-			first := startRead(serverConn)
-			if _, err := clientRaw.Write(record[:tt.split]); err != nil {
-				t.Fatalf("deliver first part: %v", err)
-			}
-			if err := serverConn.SetReadDeadline(time.Now()); err != nil {
-				t.Fatalf("set read deadline: %v", err)
-			}
-			res := awaitRead(t, first)
-			var netErr net.Error
-			if !errors.As(res.err, &netErr) || !netErr.Timeout() {
-				t.Fatalf("Read past the deadline = (%q, %v), want a timeout", res.data, res.err)
+			delivered := 0
+			for _, cut := range tt.cuts {
+				// net.Pipe returns from Write only once the reader has taken
+				// every byte, so this part is with the server before the
+				// deadline.
+				read := startRead(serverConn)
+				if _, err := clientRaw.Write(record[delivered:cut]); err != nil {
+					t.Fatalf("deliver bytes %d-%d: %v", delivered, cut, err)
+				}
+				delivered = cut
+				if err := serverConn.SetReadDeadline(time.Now()); err != nil {
+					t.Fatalf("set read deadline: %v", err)
+				}
+				res := awaitRead(t, read)
+				var netErr net.Error
+				if !errors.As(res.err, &netErr) || !netErr.Timeout() {
+					t.Fatalf("Read past the deadline with %d bytes = (%q, %v), want a timeout", cut, res.data, res.err)
+				}
+				if err := serverConn.SetReadDeadline(time.Time{}); err != nil {
+					t.Fatalf("clear read deadline: %v", err)
+				}
 			}
 
-			if err := serverConn.SetReadDeadline(time.Time{}); err != nil {
-				t.Fatalf("clear read deadline: %v", err)
-			}
-			second := startRead(serverConn)
+			read := startRead(serverConn)
 			go func() {
-				_, _ = clientRaw.Write(record[tt.split:])
+				_, _ = clientRaw.Write(record[delivered:])
 			}()
-			res = awaitRead(t, second)
+			res := awaitRead(t, read)
 			if res.err != nil || res.data != "hello" {
 				t.Fatalf("Read after clearing the deadline = (%q, %v), want %q", res.data, res.err, "hello")
+			}
+		})
+	}
+}
+
+func TestConn_EOFInsideRecordIsUnexpected(t *testing.T) {
+	tests := []struct {
+		name string
+		cut  int // record bytes that arrive before the peer closes
+		want error
+	}{
+		{name: "at a record boundary", cut: 0, want: io.EOF},
+		{name: "inside header", cut: 3, want: io.ErrUnexpectedEOF},
+		{name: "right after the header", cut: 5, want: io.ErrUnexpectedEOF},
+		{name: "inside payload", cut: 10, want: io.ErrUnexpectedEOF},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clientRaw, serverRaw := net.Pipe()
+			defer serverRaw.Close()
+
+			clientWire := &captureWritesConn{Conn: clientRaw}
+			client, serverConn := handshakeOverPipe(t, clientWire, serverRaw)
+
+			clientWire.capture = true
+			if _, err := client.Write([]byte("hello")); err != nil {
+				t.Fatalf("client write: %v", err)
+			}
+			record := clientWire.captured
+
+			read := startRead(serverConn)
+			if tt.cut > 0 {
+				if _, err := clientRaw.Write(record[:tt.cut]); err != nil {
+					t.Fatalf("deliver first part: %v", err)
+				}
+			}
+			_ = clientRaw.Close()
+			if res := awaitRead(t, read); !errors.Is(res.err, tt.want) {
+				t.Fatalf("Read after the peer closed = (%q, %v), want %v", res.data, res.err, tt.want)
 			}
 		})
 	}

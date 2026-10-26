@@ -40,7 +40,7 @@ type Conn struct {
 
 	// in is the only reader of raw: the handshake reads through it first,
 	// and Read only after ensureHandshake, under readMu. readErr is the first
-	// non-timeout record-layer failure; every later Read returns it.
+	// Read failure other than a timeout; every later Read returns it.
 	readMu  sync.Mutex
 	in      recordReader
 	readErr error
@@ -294,9 +294,11 @@ func (c *Conn) Read(b []byte) (int, error) {
 			if len(payload) > 0 {
 				msgType = payload[0]
 			}
-			return 0, fmt.Errorf("tls: unsupported post-handshake handshake message type 0x%02x", msgType)
+			c.readErr = fmt.Errorf("tls: unsupported post-handshake handshake message type 0x%02x", msgType)
+			return 0, c.readErr
 		}
-		return 0, fmt.Errorf("tls: unsupported record inner type 0x%02x", innerType)
+		c.readErr = fmt.Errorf("tls: unsupported record inner type 0x%02x", innerType)
+		return 0, c.readErr
 	}
 
 	n := copy(b, c.readBuf)

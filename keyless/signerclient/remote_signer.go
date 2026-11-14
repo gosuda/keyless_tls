@@ -53,6 +53,7 @@ func NewRemoteSigner(cfg RemoteSignerConfig) (*RemoteSigner, error) {
 		return nil, err
 	}
 	transport := &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
 		TLSClientConfig:     tlsConf,
 		MaxIdleConns:        100,
 		IdleConnTimeout:     90 * time.Second,

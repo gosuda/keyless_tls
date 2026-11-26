@@ -8,9 +8,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -19,6 +23,6 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Go tests with race detector
-        run: go test -race ./...
+        run: go test -race -count=1 ./...
       - name: Go vet
         run: go vet ./...
